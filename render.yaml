@@ -8,3 +8,5 @@ services:
     envVars:
       - key: AUTO_BROWSER
         value: "0"
+      - key: PYTHON_VERSION
+        value: "3.11.9"  # ここを追加
