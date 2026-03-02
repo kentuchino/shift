@@ -1,24 +1,26 @@
 """
-シフト表自動作成アプリ v4.0
+シフト表自動作成アプリ v5.0
 新機能:
-  - 公休日数をなるべく指定数に近づける（リーダー以外）
-  - 連続夜勤（Staff_Masterで○指定の職員のみ緊急時に許可）
-  - 勤務間隔：なるべく3〜4日に1回休み（ソフト制約）
-  - 同一勤務の連続を避ける（ソフト制約、パート指定除く）
-  - 主任：本来の職員だけでは組めない時のみ早出で使用
+  - Staff_Masterのユニット列をA/Bのみに制限
+  - ユニット兼務（◯✕）列を追加：兼務職員が他ユニット勤務時はA早/B早/A遅/B遅で表示
+  - 集計行にCOUNTIF数式（A早/B早/A遅/B遅/夜勤）を使用
+  - 主任のシフトをA早/B早で表示
+  - favicon.pngをファビコンとして使用
+  - .xlsmファイルの選択・アップロードに対応
+  - WebUIを全面リデザイン（ロゴ・アニメーション強化）
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 import pandas as pd
-import shutil, os, uuid, re
+import shutil, os, uuid, re, base64, pathlib
 from ortools.sat.python import cp_model
 from datetime import datetime, timedelta
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Alignment
+from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
 from openpyxl.utils import get_column_letter
 from collections import defaultdict
 
-app = FastAPI(title="シフト表自動作成アプリ v4.0")
+app = FastAPI(title="シフト表自動作成アプリ v5.0")
 TEMP_DIR = "temp_files"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -31,11 +33,22 @@ GREEN_FILL  = PatternFill("solid", fgColor="90EE90")
 YELLOW_FILL = PatternFill("solid", fgColor="FFFF99")
 GRAY_FILL   = PatternFill("solid", fgColor="D3D3D3")
 BLUE_FILL   = PatternFill("solid", fgColor="BDD7EE")   # 主任使用日
+HEADER_FILL = PatternFill("solid", fgColor="4472C4")
+HEADER_FILL2= PatternFill("solid", fgColor="5B9BD5")
+A_UNIT_FILL = PatternFill("solid", fgColor="DEEAF1")   # Aユニット薄青
+B_UNIT_FILL = PatternFill("solid", fgColor="E2EFDA")   # Bユニット薄緑
 
 WEEKDAY_MAP = {
     "月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6,
     "月曜": 0, "火曜": 1, "水曜": 2, "木曜": 3, "金曜": 4, "土曜": 5, "日曜": 6,
 }
+
+# ── favicon 読み込み ──
+FAVICON_B64 = ""
+_favicon_path = pathlib.Path(__file__).parent / "favicon.png"
+if _favicon_path.exists():
+    with open(_favicon_path, "rb") as _f:
+        FAVICON_B64 = base64.b64encode(_f.read()).decode()
 
 
 # ========================================================
@@ -228,6 +241,20 @@ def generate_shift(file_path):
     # 連続夜勤: ○ の職員のみ許可
     consec_night_map = get_map("連続夜勤")   # "○" or "×"
 
+    # ── ユニット兼務列の読み込み ──
+    kanmu_col = next((c for c in staff_df.columns if "兼務" in str(c)), None)
+    if kanmu_col:
+        kanmu_map = dict(zip(staff_df["職員名"], staff_df[kanmu_col].astype(str).str.strip()))
+    else:
+        # 後方互換: ユニット列が "A・B" の場合も兼務とみなす
+        kanmu_map = {}
+        for s in all_staff_names:
+            u = str(unit_map.get(s, "")).strip()
+            if u == "A・B":
+                kanmu_map[s] = "○"
+            else:
+                kanmu_map[s] = "×"
+
     # 固定公休
     fixed_holiday_map = {}
     fhcol = next((c for c in staff_df.columns if "固定" in str(c) and "休" in str(c)), None)
@@ -241,12 +268,7 @@ def generate_shift(file_path):
             if wdays:
                 fixed_holiday_map[row["職員名"]] = wdays
 
-    # 主任の識別
-    SHUUNIN_NAME = "主任"
-    shuunin_list = [s for s in all_staff_names
-                    if role_map.get(s, "") in ("総合","主任") and
-                       unit_map.get(s, "") in ("nan","","NaN")]
-    # ユニット欄がnull/nanの場合を主任判定
+    # 主任の識別（ユニット欄がnull/nanの場合）
     shuunin_list = [s for s in all_staff_names
                     if str(unit_map.get(s, "")).lower() in ("nan", "", "none")]
 
@@ -270,7 +292,6 @@ def generate_shift(file_path):
     # ── 備考解析 ──
     allowed_shifts_map = {}
     weekly_work_days   = {}
-    # パート職員で勤務指定がある（Shift_Requestsに指定あり）= 同一勤務連続ペナルティを除外
     part_with_fixed = set()
 
     for s in all_staff_names:
@@ -303,8 +324,9 @@ def generate_shift(file_path):
         week_groups[week_sun.strftime("%Y-%m-%d")].append(d_idx)
     sorted_week_keys = sorted(week_groups.keys())
 
-    # A・B 兼務職員
-    ab_staff = [s for s in staff if unit_map.get(s, "") == "A・B"]
+    # ── 兼務職員（ユニット兼務=○）──
+    ab_staff = [s for s in staff if kanmu_map.get(s, "×") == "○"]
+    ab_staff_set = set(ab_staff)
 
     # ========================================================
     # CP-SAT モデル
@@ -319,7 +341,7 @@ def generate_shift(file_path):
                 x[s, d, sh] = model.NewBoolVar(f"x_{s}_{d}_{sh}")
 
     # 主任変数
-    xs = {}  # xs[shuunin_name, d, sh]
+    xs = {}
     for s in shuunin_list:
         for d in range(N):
             for sh in ALL_SHIFTS:
@@ -342,9 +364,7 @@ def generate_shift(file_path):
         for d in range(N):
             shuunin_use_a[s,d] = model.NewBoolVar(f"sh_ua_{s}_{d}")
             shuunin_use_b[s,d] = model.NewBoolVar(f"sh_ub_{s}_{d}")
-            # 主任が早出の日のみ補完可
             model.Add(shuunin_use_a[s,d] + shuunin_use_b[s,d] <= xs[s,d,"早"])
-            # 主任は同日にA・Bどちらか一方のみ
             model.Add(shuunin_use_a[s,d] + shuunin_use_b[s,d] <= 1)
 
     # ── 制約1: 1日1シフト ──
@@ -387,28 +407,28 @@ def generate_shift(file_path):
                 model.Add(var_dict[s,d_idx,"×"] == 1)
 
     # ── 制約5: 毎日の必須人数 ──
-    # 主任はどうしても組めない場合のみ補完（ペナルティで制御）
+    # 兼務職員はuea/ueb/ula/ulbで管理（固定A/Bリストから除外）
     for d in range(N):
-        # A早出
-        a_e = [x[s,d,"早"] for s in staff if unit_map.get(s) == "A"] + \
-              [uea[s,d] for s in ab_staff] + \
-              [shuunin_use_a[s,d] for s in shuunin_list]
+        # A早出（固定Aスタッフ + 兼務→Aユニット + 主任→Aユニット）
+        a_e = ([x[s,d,"早"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+               [uea[s,d] for s in ab_staff] +
+               [shuunin_use_a[s,d] for s in shuunin_list])
         model.Add(sum(a_e) == 1)
 
-        # A遅出
-        a_l = [x[s,d,"遅"] for s in staff if unit_map.get(s) == "A"] + \
-              [ula[s,d] for s in ab_staff]
+        # A遅出（固定Aスタッフ + 兼務→Aユニット）
+        a_l = ([x[s,d,"遅"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+               [ula[s,d] for s in ab_staff])
         model.Add(sum(a_l) == 1)
 
-        # B早出
-        b_e = [x[s,d,"早"] for s in staff if unit_map.get(s) == "B"] + \
-              [ueb[s,d] for s in ab_staff] + \
-              [shuunin_use_b[s,d] for s in shuunin_list]
+        # B早出（固定Bスタッフ + 兼務→Bユニット + 主任→Bユニット）
+        b_e = ([x[s,d,"早"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+               [ueb[s,d] for s in ab_staff] +
+               [shuunin_use_b[s,d] for s in shuunin_list])
         model.Add(sum(b_e) == 1)
 
-        # B遅出
-        b_l = [x[s,d,"遅"] for s in staff if unit_map.get(s) == "B"] + \
-              [ulb[s,d] for s in ab_staff]
+        # B遅出（固定Bスタッフ + 兼務→Bユニット）
+        b_l = ([x[s,d,"遅"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+               [ulb[s,d] for s in ab_staff])
         model.Add(sum(b_l) == 1)
 
         # 夜勤（主任は夜勤なし）
@@ -420,40 +440,31 @@ def generate_shift(file_path):
         model.Add(nt >= nmin_map[s])
         model.Add(nt <= nmax_map[s])
     for s in shuunin_list:
-        # 主任は夜勤0
         for d in range(N):
             model.Add(xs[s,d,"夜"] == 0)
 
-    # ── 制約7: 夜勤→翌日（通常職員）──
-    # 連続夜勤可 の職員は「夜or×」どちらかを許可
-    # 連続夜勤不可 の職員は必ず×
-    cn_vars = {}  # cn_vars[s,d]: d日目とd+1日目の連続夜勤フラグ
+    # ── 制約7: 夜勤→翌日 ──
+    cn_vars = {}
     for s in staff:
         can_consec = (consec_night_map.get(s, "×") == "○")
         for d in range(N - 1):
             if can_consec:
-                # 翌日は×か夜のどちらか（早遅日有は禁止）
                 for sh in ["早","遅","日","有"]:
                     model.Add(x[s,d+1,sh] == 0).OnlyEnforceIf(x[s,d,"夜"])
-                # 連続夜勤フラグ
                 cn = model.NewBoolVar(f"cn_{s}_{d}")
                 cn_vars[s,d] = cn
                 model.AddBoolAnd([x[s,d,"夜"], x[s,d+1,"夜"]]).OnlyEnforceIf(cn)
                 model.AddBoolOr([x[s,d,"夜"].Not(), x[s,d+1,"夜"].Not()]).OnlyEnforceIf(cn.Not())
-                # 連続夜勤後は2日×
                 if d + 3 < N:
                     model.Add(x[s,d+2,"×"] == 1).OnlyEnforceIf(cn)
                     model.Add(x[s,d+3,"×"] == 1).OnlyEnforceIf(cn)
                 elif d + 2 < N:
                     model.Add(x[s,d+2,"×"] == 1).OnlyEnforceIf(cn)
-                # 3連続夜勤禁止
                 if d + 2 < N:
                     model.Add(x[s,d,"夜"] + x[s,d+1,"夜"] + x[s,d+2,"夜"] <= 2)
             else:
-                # 通常: 夜勤→翌日必ず×
                 model.Add(x[s,d+1,"×"] == 1).OnlyEnforceIf(x[s,d,"夜"])
 
-    # 主任も夜勤なしなので夜→×は不要だが念のため
     for s in shuunin_list:
         for d in range(N - 1):
             model.Add(xs[s,d+1,"×"] == 1).OnlyEnforceIf(xs[s,d,"夜"])
@@ -533,12 +544,11 @@ def generate_shift(file_path):
             else:
                 model.Add(sum(wv) <= round(target * len(didx) / 7 + 0.5))
 
-    # ── 制約15: 主任は早出か×のみ（有給・遅・夜・日すべて禁止） ──
+    # ── 制約15: 主任は早出か×のみ ──
     for s in shuunin_list:
         for d in range(N):
             for sh in ["遅","夜","日","有"]:
                 req = requests.get(s, {}).get(days_norm[d])
-                # Shift_Requestsで明示的に指定されている場合のみ例外
                 if req and req[0] == sh and req[1] == "指定":
                     continue
                 model.Add(xs[s,d,sh] == 0)
@@ -548,14 +558,9 @@ def generate_shift(file_path):
     # ======================================================
     penalty_terms = []
 
-    # ── ソフト1: 主任使用日数（最優先で避ける）──
+    # ── ソフト1: 主任使用ペナルティ ──
     for s in shuunin_list:
         for d in range(N):
-            # 主任が働く日（×以外）にペナルティ
-            work_var = model.NewBoolVar(f"sh_work_{s}_{d}")
-            model.Add(xs[s,d,"×"] == 0).OnlyEnforceIf(work_var)
-            model.Add(xs[s,d,"×"] == 1).OnlyEnforceIf(work_var.Not())
-            # 主任早出 = use_a or use_b のどちらか
             penalty_terms.append((xs[s,d,"早"], 200))
 
     # ── ソフト2: 連続夜勤使用ペナルティ ──
@@ -571,17 +576,14 @@ def generate_shift(file_path):
             continue
         off_count = model.NewIntVar(0, N, f"off_{s}")
         model.Add(off_count == sum(x[s,d,"×"] for d in range(N)))
-        # オーバー分（公休が多すぎる→勤務を増やす）
         over_v  = model.NewIntVar(0, N, f"over_{s}")
         under_v = model.NewIntVar(0, N, f"under_{s}")
         model.Add(over_v  >= off_count - target_off)
         model.Add(over_v  >= 0)
         model.Add(under_v >= target_off - off_count)
         model.Add(under_v >= 0)
-        # 目的: オーバーも減らしたいが、アンダー（公休少なすぎ）は許容
-        # 公休過多（over）にだけペナルティ（= もっと勤務を入れる）
-        penalty_terms.append((over_v,  8))  # 公休が多すぎたら減らす
-        penalty_terms.append((under_v, 4))  # 公休が少なすぎても軽ペナルティ
+        penalty_terms.append((over_v,  8))
+        penalty_terms.append((under_v, 4))
 
     # ── ソフト4: 早遅の平準化（リーダー以外）──
     non_leader = [s for s in staff if role_map.get(s) != "リーダー"]
@@ -669,7 +671,7 @@ def generate_shift(file_path):
                     result[s][d] = sh
                     break
 
-    # A・B職員ユニット割り当て
+    # 兼務職員ユニット割り当て
     ab_unit_result = {}
     for s in ab_staff:
         ab_unit_result[s] = {}
@@ -682,7 +684,7 @@ def generate_shift(file_path):
             else:
                 ab_unit_result[s][d] = None
 
-    # 主任がどのユニットに入ったか
+    # 主任ユニット
     shuunin_unit_result = {}
     for s in shuunin_list:
         shuunin_unit_result[s] = {}
@@ -697,7 +699,7 @@ def generate_shift(file_path):
                 shuunin_unit_result[s][d] = None
 
     return (result, staff, shuunin_list, unit_map, cont_map, role_map,
-            days_norm, requests, ab_unit_result, shuunin_unit_result)
+            days_norm, requests, ab_unit_result, shuunin_unit_result, kanmu_map)
 
 
 # ========================================================
@@ -705,9 +707,16 @@ def generate_shift(file_path):
 # ========================================================
 def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map,
                        days_norm, requests, ab_unit_result, shuunin_unit_result,
-                       input_path, output_path):
-    shutil.copy(input_path, output_path)
-    wb = load_workbook(output_path)
+                       kanmu_map, input_path, output_path):
+    """
+    ユニット付き表示:
+      - 固定A職員の早/遅 → A早/A遅
+      - 固定B職員の早/遅 → B早/B遅
+      - 兼務職員の早/遅  → 割り当てユニット+早/遅 (例: B早, A遅)
+      - 主任の早         → A早 or B早
+      - 夜/×/有/日      → そのまま
+    """
+    wb = load_workbook(input_path, keep_vba=True if input_path.endswith(".xlsm") else False)
     if "shift_result" in wb.sheetnames:
         del wb["shift_result"]
     ws = wb.create_sheet("shift_result")
@@ -716,294 +725,620 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
     weekday_ja = ["月","火","水","木","金","土","日"]
     DATE_START_COL = 3
     SUMMARY_COL    = DATE_START_COL + N
+    # 個人サマリー列: 早出/遅出/日勤/夜勤/公休
     SUMMARY_HDRS   = ["早出","遅出","日勤","夜勤","公休"]
 
-    all_disp_staff = shuunin_list + staff   # 主任を先頭に
+    all_disp_staff = shuunin_list + staff
     STAFF_START_ROW  = 4
     SHUUNIN_SEP_ROW  = STAFF_START_ROW + len(shuunin_list)
-    SUMMARY_ROW_BASE = STAFF_START_ROW + len(all_disp_staff) + 1
+    # sorted_staffを先に計算（COUNTIFレンジ計算のため）
+    def unit_order(s):
+        u = unit_map.get(s, "")
+        k = kanmu_map.get(s, "×")
+        if u == "A" and k != "○": return 0
+        if k == "○": return 1
+        if u == "B": return 2
+        return 3
+    sorted_staff = sorted(staff, key=unit_order)
+    LAST_STAFF_ROW = SHUUNIN_SEP_ROW + len(sorted_staff)
+    SUMMARY_ROW_BASE = LAST_STAFF_ROW + 2  # 空白1行を挟む
 
-    # ── ヘッダー ──
-    ws.cell(1, 1, "作成月")
+    # ── ユニット付きシフト文字列を返すヘルパー ──
+    def display_val(s, d):
+        sh = result[s].get(d, "×")
+        if sh not in ("早", "遅"):
+            return sh
+        if s in shuunin_list:
+            unit = shuunin_unit_result.get(s, {}).get(d)
+            return (unit + sh) if unit else sh
+        elif kanmu_map.get(s, "×") == "○":
+            unit = ab_unit_result.get(s, {}).get(d)
+            return (unit + sh) if unit else sh
+        else:
+            unit = unit_map.get(s, "")
+            return (unit + sh) if unit in ("A", "B") else sh
+
+    # ── セル色決定 ──
+    def cell_fill(s, d):
+        date_obj = days_norm[d]
+        if s in requests and date_obj in requests[s]:
+            _, rtype = requests[s][date_obj]
+            if rtype == "希望":
+                return PINK_FILL
+            elif rtype == "指定":
+                return GREEN_FILL
+        if s in shuunin_list:
+            unit = shuunin_unit_result.get(s, {}).get(d)
+            sh   = result[s].get(d, "×")
+            if sh == "早" and unit:
+                return BLUE_FILL
+        return None
+
+    # ── ヘッダー行 ──
+    ws.cell(1, 1, "作成月").font = Font(bold=True)
     ws.cell(1, 2, days_norm[0].strftime("%Y年%m月"))
-    ws.cell(2, 2, "曜日")
-    ws.cell(3, 1, "ユニット")
-    ws.cell(3, 2, "職員名")
+    ws.cell(2, 2, "曜日").alignment = Alignment(horizontal="center")
+    ws.cell(3, 1, "ユニット").alignment = Alignment(horizontal="center")
+    ws.cell(3, 2, "職員名").alignment  = Alignment(horizontal="center")
+    ws.cell(3, 1).fill = HEADER_FILL; ws.cell(3, 1).font = Font(bold=True, color="FFFFFF")
+    ws.cell(3, 2).fill = HEADER_FILL; ws.cell(3, 2).font = Font(bold=True, color="FFFFFF")
 
     for i, d in enumerate(days_norm):
         col = DATE_START_COL + i
-        ws.cell(1, col, d.day).alignment = Alignment(horizontal="center")
+        c1 = ws.cell(1, col, d.day)
+        c1.alignment = Alignment(horizontal="center")
+        c1.font = Font(bold=True)
         wd_cell = ws.cell(2, col, weekday_ja[d.weekday()])
         wd_cell.alignment = Alignment(horizontal="center")
         if d.weekday() == 5:
             wd_cell.fill = PatternFill("solid", fgColor="CCE5FF")
         elif d.weekday() == 6:
             wd_cell.fill = PatternFill("solid", fgColor="FFCCCC")
+        # 日付ヘッダー行に薄い枠
+        ws.cell(3, col).fill = HEADER_FILL2
+        ws.cell(3, col).font = Font(color="FFFFFF")
 
     for k, h in enumerate(SUMMARY_HDRS):
         c = ws.cell(3, SUMMARY_COL + k, h)
         c.fill = YELLOW_FILL
         c.alignment = Alignment(horizontal="center")
-    ws.cell(3, 1).fill = YELLOW_FILL
-    ws.cell(3, 2).fill = YELLOW_FILL
+        c.font = Font(bold=True)
 
-    # ── 主任行（上部に表示）──
+    # ── 主任行 ──
     for idx, s in enumerate(shuunin_list):
         row = STAFF_START_ROW + idx
-        u_label = "主任"
-        ws.cell(row, 1, u_label).alignment = Alignment(horizontal="center")
-        ws.cell(row, 2, s).alignment = Alignment(horizontal="center")
+        ws.cell(row, 1, "主任").alignment = Alignment(horizontal="center")
         ws.cell(row, 1).fill = BLUE_FILL
+        ws.cell(row, 1).font = Font(bold=True)
+        ws.cell(row, 2, s).alignment = Alignment(horizontal="center")
         ws.cell(row, 2).fill = BLUE_FILL
 
         for d in range(N):
             col  = DATE_START_COL + d
-            sh   = result[s][d]
-            cell = ws.cell(row, col, sh)
+            val  = display_val(s, d)
+            cell = ws.cell(row, col, val)
             cell.alignment = Alignment(horizontal="center")
-            date_obj = days_norm[d]
-            # 主任が使われた日は青色
-            su_r = shuunin_unit_result.get(s, {}).get(d)
-            if sh == "早" and su_r:
-                cell.fill = BLUE_FILL
-            elif s in requests and date_obj in requests[s]:
-                _, rtype = requests[s][date_obj]
-                if rtype == "希望":
-                    cell.fill = PINK_FILL
-                elif rtype == "指定":
-                    cell.fill = GREEN_FILL
+            f = cell_fill(s, d)
+            if f:
+                cell.fill = f
 
+        # 個人COUNTIF集計
         ds  = get_column_letter(DATE_START_COL)
         de  = get_column_letter(DATE_START_COL + N - 1)
         rng = f"{ds}{row}:{de}{row}"
-        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"早")')
-        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"遅")')
+        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"A早")+COUNTIF({rng},"B早")')
+        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"A遅")+COUNTIF({rng},"B遅")')
         ws.cell(row, SUMMARY_COL + 2, f'=COUNTIF({rng},"日")')
         ws.cell(row, SUMMARY_COL + 3, f'=COUNTIF({rng},"夜")')
         ws.cell(row, SUMMARY_COL + 4, f'=COUNTIF({rng},"×")')
+        for k in range(len(SUMMARY_HDRS)):
+            ws.cell(row, SUMMARY_COL + k).alignment = Alignment(horizontal="center")
 
     # 主任と一般職員の区切り線
     if shuunin_list:
-        sep_row = SHUUNIN_SEP_ROW
         for col in range(1, SUMMARY_COL + len(SUMMARY_HDRS)):
-            ws.cell(sep_row, col).fill = PatternFill("solid", fgColor="E0E0E0")
+            ws.cell(SHUUNIN_SEP_ROW, col).fill = PatternFill("solid", fgColor="E0E0E0")
 
     # ── 一般職員行 ──
-    def unit_order(s):
-        u = unit_map.get(s, "")
-        if u == "A":    return 0
-        if u == "A・B": return 1
-        return 2
-    sorted_staff = sorted(staff, key=unit_order)
-
     for idx, s in enumerate(sorted_staff):
         row = SHUUNIN_SEP_ROW + idx + (1 if shuunin_list else 0)
-        ws.cell(row, 1, unit_map.get(s, "")).alignment = Alignment(horizontal="center")
-        ws.cell(row, 2, s).alignment = Alignment(horizontal="center")
+        u   = unit_map.get(s, "")
+        k   = kanmu_map.get(s, "×")
+        # ユニット表示
+        if k == "○":
+            u_label = f"{u}兼"
+        else:
+            u_label = u
+        uc = ws.cell(row, 1, u_label)
+        uc.alignment = Alignment(horizontal="center")
+        if u == "A":
+            uc.fill = A_UNIT_FILL
+        elif u == "B":
+            uc.fill = B_UNIT_FILL
+
+        nc = ws.cell(row, 2, s)
+        nc.alignment = Alignment(horizontal="center")
+        if u == "A":
+            nc.fill = A_UNIT_FILL
+        elif u == "B":
+            nc.fill = B_UNIT_FILL
 
         for d in range(N):
             col  = DATE_START_COL + d
-            sh   = result[s][d]
-            cell = ws.cell(row, col, sh)
+            val  = display_val(s, d)
+            cell = ws.cell(row, col, val)
             cell.alignment = Alignment(horizontal="center")
-            date_obj = days_norm[d]
-            if s in requests and date_obj in requests[s]:
-                _, rtype = requests[s][date_obj]
-                if rtype == "希望":
-                    cell.fill = PINK_FILL
-                elif rtype == "指定":
-                    cell.fill = GREEN_FILL
+            f = cell_fill(s, d)
+            if f:
+                cell.fill = f
 
+        # 個人COUNTIF集計
         ds  = get_column_letter(DATE_START_COL)
         de  = get_column_letter(DATE_START_COL + N - 1)
         rng = f"{ds}{row}:{de}{row}"
-        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"早")')
-        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"遅")')
+        # 早出: A早+B早（兼務でない固定スタッフはAor B早のみ）
+        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"A早")+COUNTIF({rng},"B早")')
+        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"A遅")+COUNTIF({rng},"B遅")')
         ws.cell(row, SUMMARY_COL + 2, f'=COUNTIF({rng},"日")')
         ws.cell(row, SUMMARY_COL + 3, f'=COUNTIF({rng},"夜")')
         ws.cell(row, SUMMARY_COL + 4, f'=COUNTIF({rng},"×")')
+        for k2 in range(len(SUMMARY_HDRS)):
+            ws.cell(row, SUMMARY_COL + k2).alignment = Alignment(horizontal="center")
 
-    # ── 日別集計行 ──
-    ab_staff_local = [s for s in staff if unit_map.get(s) == "A・B"]
-    label_names = ["A早出","B早出","A遅出","B遅出","夜勤"]
-    for k, lbl in enumerate(label_names):
+    # ── 日別集計行（COUNTIF数式）──
+    # COUNTIFレンジ: 全スタッフ行（STAFF_START_ROW ～ LAST_STAFF_ROW）
+    daily_labels = ["A早出","B早出","A遅出","B遅出","夜勤"]
+    daily_values = ["A早",  "B早",  "A遅",  "B遅",  "夜" ]
+    daily_fills  = [A_UNIT_FILL, B_UNIT_FILL, A_UNIT_FILL, B_UNIT_FILL, GRAY_FILL]
+
+    for k, (lbl, fill) in enumerate(zip(daily_labels, daily_fills)):
         r = SUMMARY_ROW_BASE + k
         c = ws.cell(r, 2, lbl)
-        c.fill = GRAY_FILL
+        c.fill = fill
         c.alignment = Alignment(horizontal="center")
+        c.font = Font(bold=True)
 
     for i in range(N):
         col = DATE_START_COL + i
-        cnt_ae = (sum(1 for s in staff if unit_map.get(s)=="A" and result[s][i]=="早") +
-                  sum(1 for s in ab_staff_local if ab_unit_result.get(s,{}).get(i)=="A" and result[s][i]=="早") +
-                  sum(1 for s in shuunin_list if shuunin_unit_result.get(s,{}).get(i)=="A" and result[s][i]=="早"))
-        cnt_be = (sum(1 for s in staff if unit_map.get(s)=="B" and result[s][i]=="早") +
-                  sum(1 for s in ab_staff_local if ab_unit_result.get(s,{}).get(i)=="B" and result[s][i]=="早") +
-                  sum(1 for s in shuunin_list if shuunin_unit_result.get(s,{}).get(i)=="B" and result[s][i]=="早"))
-        cnt_al = (sum(1 for s in staff if unit_map.get(s)=="A" and result[s][i]=="遅") +
-                  sum(1 for s in ab_staff_local if ab_unit_result.get(s,{}).get(i)=="A" and result[s][i]=="遅"))
-        cnt_bl = (sum(1 for s in staff if unit_map.get(s)=="B" and result[s][i]=="遅") +
-                  sum(1 for s in ab_staff_local if ab_unit_result.get(s,{}).get(i)=="B" and result[s][i]=="遅"))
-        cnt_nt = sum(1 for s in staff if result[s][i]=="夜")
-        for k, v in enumerate([cnt_ae, cnt_be, cnt_al, cnt_bl, cnt_nt]):
-            ws.cell(SUMMARY_ROW_BASE + k, col, v).alignment = Alignment(horizontal="center")
+        col_letter = get_column_letter(col)
+        # スタッフ全行のレンジ（区切り行を含むが空白なのでCOUNTIFに影響なし）
+        cnt_range = f"{col_letter}{STAFF_START_ROW}:{col_letter}{LAST_STAFF_ROW}"
+        for k, (_, dv) in enumerate(zip(daily_labels, daily_values)):
+            r = SUMMARY_ROW_BASE + k
+            c = ws.cell(r, col, f'=COUNTIF({cnt_range},"{dv}")')
+            c.alignment = Alignment(horizontal="center")
 
-    # 列幅
+    # ── 列幅 ──
     ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 8
+    ws.column_dimensions["B"].width = 10
     for i in range(N):
-        ws.column_dimensions[get_column_letter(DATE_START_COL + i)].width = 4
+        ws.column_dimensions[get_column_letter(DATE_START_COL + i)].width = 5
     for k in range(len(SUMMARY_HDRS)):
-        ws.column_dimensions[get_column_letter(SUMMARY_COL + k)].width = 6
+        ws.column_dimensions[get_column_letter(SUMMARY_COL + k)].width = 8
 
     wb.save(output_path)
 
 
 # ========================================================
-# Web UI
+# Web UI HTML
 # ========================================================
-HTML_CONTENT = """<!DOCTYPE html>
+_favicon_tag = (f'<link rel="icon" type="image/png" href="data:image/png;base64,{FAVICON_B64}">'
+                if FAVICON_B64 else '<link rel="icon" href="/favicon.png">')
+
+HTML_CONTENT = f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>シフト表自動作成アプリ v4.0</title>
+<title>シフト表自動作成アプリ v5.0</title>
+{_favicon_tag}
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:30px 20px}
-.card{background:#fff;padding:40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-width:960px;width:100%}
-h1{color:#667eea;font-size:1.9em;text-align:center;margin-bottom:6px}
-.ver{text-align:center;color:#764ba2;font-weight:bold;margin-bottom:4px;font-size:.9em}
-.sub{text-align:center;color:#888;margin-bottom:20px;font-size:.85em}
-.sec-title{font-weight:bold;color:#333;margin-bottom:10px;font-size:1em;border-left:4px solid #667eea;padding-left:10px;margin-top:18px}
-.rules{background:#f8f9fa;padding:14px 20px;border-radius:10px;margin-bottom:14px}
-.rules ul{list-style:none}
-.rules li{padding:4px 0;border-bottom:1px solid #eee;font-size:.86em;color:#555}
-.rules li:last-child{border-bottom:none}
-.badge{display:inline-block;background:#667eea;color:#fff;padding:1px 7px;border-radius:10px;font-size:.75em;margin-left:4px;vertical-align:middle}
-.badge.new{background:#e74c3c}
-.note{background:#fff8e1;border-left:4px solid #ffc107;padding:12px 16px;border-radius:5px;margin-bottom:18px;font-size:.86em;color:#555;line-height:1.7}
-.drop{border:3px dashed #667eea;border-radius:12px;padding:36px;text-align:center;cursor:pointer;transition:.3s}
-.drop:hover,.drop.over{background:#f0f4ff;border-color:#764ba2}
-input[type=file]{display:none}
-.pick-btn{background:#667eea;color:#fff;padding:9px 26px;border:none;border-radius:22px;cursor:pointer;font-size:.93em;margin-top:10px;display:inline-block}
-.pick-btn:hover{background:#764ba2}
-.fname{margin-top:10px;color:#555;font-weight:bold;font-size:.88em}
-.go-btn{width:100%;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:13px;border:none;border-radius:22px;font-size:1em;cursor:pointer;margin-top:16px;transition:.3s}
-.go-btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 22px rgba(102,126,234,.4)}
-.go-btn:disabled{background:#ccc;cursor:not-allowed}
-.spin-wrap{display:none;text-align:center;margin-top:20px}
-.spinner{border:4px solid #eee;border-top:4px solid #667eea;border-radius:50%;width:44px;height:44px;animation:spin 1s linear infinite;margin:0 auto 10px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.pmsg{color:#667eea;font-size:.9em;line-height:1.6}
-.ok{display:none;background:#d4edda;border:1px solid #c3e6cb;color:#155724;padding:16px;border-radius:10px;margin-top:16px;text-align:center}
-.dl-btn{display:inline-block;background:#28a745;color:#fff;padding:10px 28px;text-decoration:none;border-radius:20px;margin-top:10px;font-size:.95em}
-.dl-btn:hover{background:#218838}
-.err{display:none;background:#f8d7da;border:1px solid #f5c6cb;color:#721c24;padding:14px;border-radius:10px;margin-top:16px;word-break:break-all;white-space:pre-wrap;font-size:.88em}
-.legend{display:flex;gap:14px;margin-top:14px;flex-wrap:wrap}
-.legend-item{display:flex;align-items:center;gap:6px;font-size:.82em;color:#555}
-.sw{width:16px;height:16px;border-radius:3px;border:1px solid #ccc}
-.c-pink{background:#FFB6C1}.c-green{background:#90EE90}.c-blue{background:#BDD7EE}
+/* ── リセット・ベース ── */
+*{{margin:0;padding:0;box-sizing:border-box}}
+:root{{
+  --primary:#2563EB;--primary-dark:#1D4ED8;--primary-light:#DBEAFE;
+  --accent:#7C3AED;--accent-light:#EDE9FE;
+  --success:#059669;--warn:#D97706;--danger:#DC2626;
+  --gray-50:#F9FAFB;--gray-100:#F3F4F6;--gray-200:#E5E7EB;--gray-600:#4B5563;--gray-800:#1F2937;
+  --radius:16px;--shadow:0 25px 50px rgba(0,0,0,.18);
+}}
+body{{
+  font-family:'Segoe UI','Noto Sans JP',sans-serif;
+  background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);
+  min-height:100vh;display:flex;flex-direction:column;align-items:center;
+  padding:24px 16px 48px;
+}}
+
+/* ── ヘッダー ── */
+.app-header{{
+  width:100%;max-width:900px;display:flex;align-items:center;
+  justify-content:space-between;margin-bottom:28px;
+  animation:slideDown .6s ease both;
+}}
+.logo-block{{display:flex;align-items:center;gap:14px}}
+.logo-icon{{
+  width:60px;height:60px;background:linear-gradient(135deg,var(--primary),var(--accent));
+  border-radius:16px;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 24px rgba(37,99,235,.45);
+  transition:transform .3s;
+}}
+.logo-icon:hover{{transform:rotate(8deg) scale(1.08)}}
+.logo-icon svg{{width:34px;height:34px;fill:#fff}}
+.logo-text h1{{font-size:1.55em;font-weight:800;color:#fff;letter-spacing:-.5px;line-height:1.1}}
+.logo-text p{{font-size:.78em;color:rgba(255,255,255,.7);margin-top:2px}}
+.ver-badge{{
+  background:linear-gradient(135deg,var(--primary),var(--accent));
+  color:#fff;padding:6px 14px;border-radius:20px;font-size:.78em;font-weight:700;
+  box-shadow:0 4px 12px rgba(124,58,237,.4);white-space:nowrap;
+}}
+
+/* ── メインカード ── */
+.card{{
+  background:rgba(255,255,255,.97);
+  border-radius:var(--radius);box-shadow:var(--shadow);
+  max-width:900px;width:100%;overflow:hidden;
+  animation:fadeUp .7s .15s ease both;
+}}
+
+/* ── セクション ── */
+.section{{padding:28px 32px;border-bottom:1px solid var(--gray-200)}}
+.section:last-child{{border-bottom:none}}
+.sec-title{{
+  display:flex;align-items:center;gap:10px;
+  font-size:1.02em;font-weight:700;color:var(--gray-800);
+  margin-bottom:14px;
+}}
+.sec-title .icon{{
+  width:32px;height:32px;background:var(--primary-light);
+  border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1em;
+}}
+
+/* ── 制約リスト ── */
+.rules-grid{{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
+  gap:8px;
+}}
+.rule-item{{
+  display:flex;align-items:flex-start;gap:8px;
+  background:var(--gray-50);border-radius:8px;
+  padding:8px 12px;font-size:.85em;color:var(--gray-600);
+  border-left:3px solid var(--gray-200);
+  transition:border-color .2s,background .2s;
+}}
+.rule-item:hover{{background:var(--primary-light);border-left-color:var(--primary)}}
+.rule-item .chk{{color:var(--success);font-weight:700;flex-shrink:0}}
+.badge{{
+  display:inline-block;background:var(--danger);color:#fff;
+  padding:1px 6px;border-radius:8px;font-size:.7em;margin-left:4px;vertical-align:middle;
+  font-weight:700;
+}}
+.badge.v5{{background:var(--accent)}}
+
+/* ── NOTE ── */
+.note{{
+  background:#FFFBEB;border-left:4px solid var(--warn);
+  padding:12px 16px;border-radius:8px;
+  font-size:.86em;color:#78350F;line-height:1.75;
+}}
+.note strong{{color:#92400E}}
+
+/* ── アップロードエリア ── */
+.drop-zone{{
+  border:2.5px dashed var(--primary);border-radius:12px;
+  padding:40px 24px;text-align:center;cursor:pointer;
+  transition:background .3s,border-color .3s,transform .2s;
+  position:relative;overflow:hidden;
+}}
+.drop-zone::before{{
+  content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse at 50% 0%,rgba(37,99,235,.08) 0%,transparent 70%);
+  opacity:0;transition:opacity .3s;
+}}
+.drop-zone:hover::before,.drop-zone.over::before{{opacity:1}}
+.drop-zone:hover,.drop-zone.over{{
+  background:var(--primary-light);border-color:var(--primary-dark);
+  transform:translateY(-2px);
+}}
+.drop-icon{{font-size:2.8em;margin-bottom:10px;animation:bounce 2.5s infinite}}
+.drop-text{{color:var(--gray-600);font-size:.95em;line-height:1.6}}
+.drop-sub{{color:var(--gray-200);margin:8px 0;font-size:.85em}}
+input[type=file]{{display:none}}
+.pick-btn{{
+  background:linear-gradient(135deg,var(--primary),var(--accent));
+  color:#fff;padding:9px 26px;border:none;border-radius:22px;
+  cursor:pointer;font-size:.9em;font-weight:600;
+  box-shadow:0 4px 12px rgba(37,99,235,.3);transition:transform .2s,box-shadow .2s;
+  display:inline-block;
+}}
+.pick-btn:hover{{transform:translateY(-2px);box-shadow:0 6px 18px rgba(37,99,235,.45)}}
+.fname{{
+  margin-top:12px;color:var(--primary-dark);font-weight:600;font-size:.9em;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+  animation:fadeIn .4s ease;
+}}
+
+/* ── 生成ボタン ── */
+.go-btn{{
+  width:100%;background:linear-gradient(135deg,var(--primary),var(--accent));
+  color:#fff;padding:14px;border:none;border-radius:22px;
+  font-size:1.05em;font-weight:700;cursor:pointer;margin-top:16px;
+  transition:transform .25s,box-shadow .25s;
+  box-shadow:0 6px 20px rgba(37,99,235,.35);
+  position:relative;overflow:hidden;
+}}
+.go-btn::after{{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent);
+  transform:translateX(-100%);transition:transform .5s;
+}}
+.go-btn:hover:not(:disabled)::after{{transform:translateX(100%)}}
+.go-btn:hover:not(:disabled){{transform:translateY(-3px);box-shadow:0 10px 28px rgba(37,99,235,.5)}}
+.go-btn:disabled{{background:var(--gray-200);color:var(--gray-600);cursor:not-allowed;box-shadow:none}}
+
+/* ── プログレス ── */
+.spin-wrap{{display:none;text-align:center;padding:24px 0}}
+.progress-bar-wrap{{
+  background:var(--gray-200);border-radius:99px;height:8px;
+  margin:16px 0 10px;overflow:hidden;
+}}
+.progress-bar{{
+  height:100%;border-radius:99px;width:0%;
+  background:linear-gradient(90deg,var(--primary),var(--accent));
+  animation:progressAnim 4s ease-in-out infinite;
+}}
+@keyframes progressAnim{{
+  0%{{width:5%}}40%{{width:60%}}70%{{width:75%}}100%{{width:90%}}
+}}
+.spinner-ring{{
+  display:inline-block;width:52px;height:52px;position:relative;margin-bottom:12px;
+}}
+.spinner-ring div{{
+  position:absolute;width:42px;height:42px;margin:4px;
+  border:4px solid transparent;border-top-color:var(--primary);
+  border-radius:50%;animation:spinRing 1.2s cubic-bezier(.5,0,.5,1) infinite;
+}}
+.spinner-ring div:nth-child(2){{animation-delay:-0.45s;border-top-color:var(--accent)}}
+.spinner-ring div:nth-child(3){{animation-delay:-0.3s;border-top-color:var(--primary);opacity:.6}}
+@keyframes spinRing{{to{{transform:rotate(360deg)}}}}
+.pmsg{{color:var(--gray-600);font-size:.92em;line-height:1.7}}
+.pmsg strong{{color:var(--primary);font-size:1.1em}}
+
+/* ── 成功・エラー ── */
+.ok-card{{
+  display:none;
+  background:linear-gradient(135deg,#ECFDF5,#D1FAE5);
+  border:1px solid #A7F3D0;border-radius:12px;
+  padding:24px;text-align:center;margin-top:16px;
+  animation:popIn .5s ease;
+}}
+.ok-card p{{color:#064E3B;font-size:1.02em;font-weight:600;margin-bottom:12px}}
+.dl-btn{{
+  display:inline-flex;align-items:center;gap:8px;
+  background:linear-gradient(135deg,var(--success),#10B981);
+  color:#fff;padding:11px 32px;text-decoration:none;
+  border-radius:22px;font-size:1em;font-weight:700;
+  box-shadow:0 4px 14px rgba(5,150,105,.4);
+  transition:transform .2s,box-shadow .2s;
+}}
+.dl-btn:hover{{transform:translateY(-2px);box-shadow:0 8px 20px rgba(5,150,105,.5)}}
+.err{{
+  display:none;background:#FEF2F2;border:1px solid #FECACA;
+  color:#7F1D1D;padding:14px 18px;border-radius:10px;margin-top:16px;
+  word-break:break-all;white-space:pre-wrap;font-size:.88em;line-height:1.6;
+  animation:fadeIn .4s ease;
+}}
+
+/* ── 凡例 ── */
+.legend{{display:flex;gap:16px;flex-wrap:wrap;margin-top:6px}}
+.legend-item{{display:flex;align-items:center;gap:6px;font-size:.83em;color:var(--gray-600)}}
+.sw{{width:16px;height:16px;border-radius:4px;border:1px solid rgba(0,0,0,.1)}}
+.c-pink{{background:#FFB6C1}}.c-green{{background:#90EE90}}.c-blue{{background:#BDD7EE}}
+.c-a{{background:#DEEAF1}}.c-b{{background:#E2EFDA}}
+
+/* ── フローティングパーティクル ── */
+.particles{{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}}
+.particle{{
+  position:absolute;width:5px;height:5px;border-radius:50%;
+  background:rgba(255,255,255,.15);
+  animation:floatUp var(--dur) linear infinite;
+  bottom:-10px;left:var(--left);
+}}
+@keyframes floatUp{{
+  0%{{transform:translateY(0) scale(1);opacity:.6}}
+  100%{{transform:translateY(-110vh) scale(.3);opacity:0}}
+}}
+
+/* ── アニメーション ── */
+@keyframes slideDown{{from{{transform:translateY(-30px);opacity:0}}to{{transform:none;opacity:1}}}}
+@keyframes fadeUp{{from{{transform:translateY(40px);opacity:0}}to{{transform:none;opacity:1}}}}
+@keyframes fadeIn{{from{{opacity:0}}to{{opacity:1}}}}
+@keyframes bounce{{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-8px)}}}}
+@keyframes popIn{{0%{{transform:scale(.85);opacity:0}}70%{{transform:scale(1.04)}}100%{{transform:scale(1);opacity:1}}}}
+
+/* ── レスポンシブ ── */
+@media(max-width:600px){{
+  .section{{padding:20px 18px}}
+  .rules-grid{{grid-template-columns:1fr}}
+  .logo-text h1{{font-size:1.2em}}
+  .logo-icon{{width:48px;height:48px}}
+}}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>📅 シフト表自動作成アプリ</h1>
-  <p class="ver">Version 4.0</p>
-  <p class="sub">Excelをアップロードするだけで最適なシフト表を自動生成</p>
 
-  <div class="sec-title">🔒 適用される制約・ルール</div>
-  <div class="rules"><ul>
-    <li>✅ ユニットA/B：毎日<strong>早出1・遅出1</strong>（A・B兼務職員はどちらか一方にカウント）</li>
-    <li>✅ 夜勤：毎日1名（個人の最少〜最高回数を厳守）</li>
-    <li>✅ 40h→最大5連勤 / 32h・パート→最大4連勤（前月継続分を考慮）</li>
-    <li>✅ 夜勤→翌日×、遅出→翌日早出禁止</li>
-    <li>✅ 希望休の前日夜勤禁止、パート職員に有給を自動割り当てしない</li>
-    <li>✅ Staff_Masterの備考（早出のみ・週N日勤務・夜勤なし等）を厳守</li>
-    <li>✅ 固定公休（曜日指定）対応</li>
-    <li>✅ <strong>公休日数をなるべく指定日数に近づける</strong>（リーダー以外）<span class="badge new">NEW</span></li>
-    <li>✅ <strong>連続夜勤</strong>：Staff_Masterで○の職員のみ緊急時に「夜夜××」を許可<span class="badge new">NEW</span></li>
-    <li>✅ <strong>勤務間隔</strong>：なるべく3〜4日に1回は休みになるよう配慮<span class="badge new">NEW</span></li>
-    <li>✅ <strong>同一勤務の連続を回避</strong>：「早早早」「遅遅遅」をなるべく避ける<span class="badge new">NEW</span></li>
-    <li>✅ <strong>主任</strong>：本来の職員では組めないときのみ早出で補完（通常は使わない）<span class="badge new">NEW</span></li>
-  </ul></div>
+<!-- パーティクル背景 -->
+<div class="particles" id="ptc"></div>
 
-  <div class="note">
-    <strong>📋 必要なシート：</strong> Staff_Master / Settings / Shift_Requests / Prev_Month / shift_result<br>
-    <strong>【連続夜勤】</strong> Staff_Masterの「連続夜勤」欄に「○」を記入した職員のみ、どうしても夜勤が組めない場合に「夜夜××」が発生します。<br>
-    <strong>【主任】</strong> ユニット欄が空欄の職員は主任扱いになります。緊急時のみ早出でAまたはBユニットを補完します（Excel上で青色表示）。<br>
-    <strong>【公休日数】</strong> リーダー以外の公休数は、Settingsで指定した日数に近づくよう自動調整します。
-  </div>
-
-  <div class="sec-title">📤 ファイルアップロード</div>
-  <form id="frm">
-    <div class="drop" id="drop">
-      <p>📂 ここにExcelファイルをドラッグ＆ドロップ</p>
-      <p style="margin:8px 0;color:#aaa">— または —</p>
-      <label for="fi" class="pick-btn">ファイルを選択</label>
-      <input type="file" id="fi" accept=".xlsx,.xls">
-      <div class="fname" id="fname"></div>
+<!-- ヘッダー -->
+<header class="app-header">
+  <div class="logo-block">
+    <div class="logo-icon">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M19 3h-1V1h-2v2H8V1H6v2H5C3.89 3 3 3.9 3 5v14c0 1.1.89 2 2 2h14c1.1 0 2-.9
+          2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11zM7 10h5v5H7z"/>
+      </svg>
     </div>
-    <button type="submit" class="go-btn" id="go">▶ シフト表を生成する</button>
-  </form>
+    <div class="logo-text">
+      <h1>シフト表 自動作成</h1>
+      <p>Shift Schedule Generator — AI Optimizer</p>
+    </div>
+  </div>
+  <div class="ver-badge">v5.0&nbsp;LATEST</div>
+</header>
 
-  <div class="spin-wrap" id="sw">
-    <div class="spinner"></div>
-    <p class="pmsg" id="pmsg">生成中… <strong>0秒</strong> 経過<br>最大5分かかる場合があります。そのままお待ちください。</p>
-  </div>
-  <div class="ok" id="ok">
-    <p>✅ シフト表の生成が完了しました！</p>
-    <a href="#" id="dl" class="dl-btn">📥 Shift_Result.xlsx をダウンロード</a>
-  </div>
-  <div class="err" id="er"></div>
+<!-- メインカード -->
+<div class="card" style="position:relative;z-index:1">
 
-  <div class="legend">
-    <div class="legend-item"><div class="sw c-pink"></div>希望休・有給（希望）</div>
-    <div class="legend-item"><div class="sw c-green"></div>勤務指定（指定）</div>
-    <div class="legend-item"><div class="sw c-blue"></div>主任補完（緊急使用）</div>
+  <!-- 制約セクション -->
+  <div class="section">
+    <div class="sec-title"><div class="icon">🔒</div>適用される制約・ルール</div>
+    <div class="rules-grid">
+      <div class="rule-item"><span class="chk">✔</span>ユニットA/B毎日<strong>早出1・遅出1</strong>（兼務職員はどちらかにカウント）</div>
+      <div class="rule-item"><span class="chk">✔</span>夜勤1名/日（個人の最少〜最高回数厳守）</div>
+      <div class="rule-item"><span class="chk">✔</span>40h→最大5連勤 / 32h・パート→最大4連勤</div>
+      <div class="rule-item"><span class="chk">✔</span>夜勤→翌日× / 遅出→翌早禁止</div>
+      <div class="rule-item"><span class="chk">✔</span>希望休前日の夜勤禁止、パートに有給自動割当なし</div>
+      <div class="rule-item"><span class="chk">✔</span>備考（早出のみ・週N日・夜勤なし等）厳守</div>
+      <div class="rule-item"><span class="chk">✔</span>固定公休（曜日指定）対応</div>
+      <div class="rule-item"><span class="chk">✔</span>公休数を指定日数に近づける（リーダー以外）<span class="badge">NEW</span></div>
+      <div class="rule-item"><span class="chk">✔</span>連続夜勤：○職員のみ緊急時「夜夜××」を許可<span class="badge">NEW</span></div>
+      <div class="rule-item"><span class="chk">✔</span>勤務間隔：3〜4日に1回休みを配慮<span class="badge">NEW</span></div>
+      <div class="rule-item"><span class="chk">✔</span>同一勤務の連続（早早早等）を回避<span class="badge">NEW</span></div>
+      <div class="rule-item"><span class="chk">✔</span>主任は緊急時のみ早出補完（A早/B早で表示）<span class="badge v5">v5</span></div>
+      <div class="rule-item"><span class="chk">✔</span>兼務職員の他ユニット勤務をA早/B早/A遅/B遅で表示<span class="badge v5">v5</span></div>
+      <div class="rule-item"><span class="chk">✔</span>集計行はCOUNTIF数式（A早/B早/A遅/B遅/夜勤）<span class="badge v5">v5</span></div>
+    </div>
   </div>
-</div>
+
+  <!-- ノート -->
+  <div class="section">
+    <div class="note">
+      <strong>📋 必要なシート：</strong> Staff_Master / Settings / Shift_Requests / Prev_Month / shift_result<br>
+      <strong>【ユニット兼務】</strong> Staff_Masterに「ユニット兼務」列を追加し ○ を記入。他ユニット勤務時は <em>A早/B早/A遅/B遅</em> で出力されます。<br>
+      <strong>【主任】</strong> ユニット欄が空欄の職員は主任扱い。緊急時のみ早出補完（Excel上で <span style="background:#BDD7EE;padding:0 4px;border-radius:3px">青色</span> 表示）。<br>
+      <strong>【集計行】</strong> シフト表下部にCOUNTIF数式でA早/B早/A遅/B遅/夜勤を自動集計します。<br>
+      <strong>【ファイル形式】</strong> .xlsx / .xlsm / .xls のいずれも対応しています。
+    </div>
+  </div>
+
+  <!-- アップロード -->
+  <div class="section">
+    <div class="sec-title"><div class="icon">📤</div>ファイルアップロード</div>
+    <form id="frm">
+      <div class="drop-zone" id="drop">
+        <div class="drop-icon">📂</div>
+        <div class="drop-text">ここにExcelファイルをドラッグ＆ドロップ</div>
+        <div class="drop-sub">— または —</div>
+        <label for="fi" class="pick-btn">📁 ファイルを選択</label>
+        <input type="file" id="fi" accept=".xlsx,.xls,.xlsm">
+        <div class="fname" id="fname"></div>
+      </div>
+      <button type="submit" class="go-btn" id="go">▶&nbsp;&nbsp;シフト表を生成する</button>
+    </form>
+
+    <div class="spin-wrap" id="sw">
+      <div class="spinner-ring"><div></div><div></div><div></div></div>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="pbar"></div></div>
+      <p class="pmsg" id="pmsg">最適化中… <strong>0秒</strong> 経過<br>最大5分かかる場合があります。そのままお待ちください。</p>
+    </div>
+    <div class="ok-card" id="ok">
+      <p>✅ シフト表の生成が完了しました！</p>
+      <a href="#" id="dl" class="dl-btn">📥 Shift_Result.xlsx をダウンロード</a>
+    </div>
+    <div class="err" id="er"></div>
+  </div>
+
+  <!-- 凡例 -->
+  <div class="section">
+    <div class="sec-title"><div class="icon">🎨</div>カラー凡例</div>
+    <div class="legend">
+      <div class="legend-item"><div class="sw c-pink"></div>希望休・有給（希望）</div>
+      <div class="legend-item"><div class="sw c-green"></div>勤務指定（Shift_Requests指定）</div>
+      <div class="legend-item"><div class="sw c-blue"></div>主任補完（緊急使用）</div>
+      <div class="legend-item"><div class="sw c-a"></div>Aユニット</div>
+      <div class="legend-item"><div class="sw c-b"></div>Bユニット</div>
+    </div>
+  </div>
+
+</div><!-- /card -->
+
 <script>
+/* ─ パーティクル生成 ─ */
+(function(){{
+  const c=document.getElementById('ptc');
+  for(let i=0;i<22;i++){{
+    const p=document.createElement('div');
+    p.className='particle';
+    p.style.setProperty('--left',Math.random()*100+'%');
+    p.style.setProperty('--dur',(6+Math.random()*10).toFixed(1)+'s');
+    p.style.animationDelay=(Math.random()*8).toFixed(2)+'s';
+    const sz=3+Math.random()*5;
+    p.style.width=sz+'px';p.style.height=sz+'px';
+    c.appendChild(p);
+  }}
+}})();
+
+/* ─ ファイル選択 ─ */
 const fi=document.getElementById('fi'),fname=document.getElementById('fname'),
       drop=document.getElementById('drop'),frm=document.getElementById('frm'),
       sw=document.getElementById('sw'),ok=document.getElementById('ok'),
       er=document.getElementById('er'),dl=document.getElementById('dl'),
       go=document.getElementById('go'),pmsg=document.getElementById('pmsg');
-fi.onchange=()=>{ if(fi.files[0]) fname.textContent='📄 '+fi.files[0].name; };
+
+function setFile(f){{
+  if(!f) return;
+  const dt=new DataTransfer();dt.items.add(f);fi.files=dt.files;
+  fname.innerHTML='<span>📄</span>'+f.name;
+}}
+fi.onchange=()=>{{ if(fi.files[0]) fname.innerHTML='<span>📄</span>'+fi.files[0].name; }};
+
 ['dragenter','dragover','dragleave','drop'].forEach(e=>
-  drop.addEventListener(e,ev=>{ev.preventDefault();ev.stopPropagation();}));
+  drop.addEventListener(e,ev=>{{ev.preventDefault();ev.stopPropagation();}}));
 ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,()=>drop.classList.add('over')));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,()=>drop.classList.remove('over')));
-drop.addEventListener('drop',e=>{
-  const f=e.dataTransfer.files;
-  if(f[0]){const dt=new DataTransfer();dt.items.add(f[0]);fi.files=dt.files;fname.textContent='📄 '+f[0].name;}
-});
-drop.addEventListener('click',()=>fi.click());
+drop.addEventListener('drop',e=>{{
+  if(e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+}});
+drop.addEventListener('click',ev=>{{
+  if(ev.target.classList.contains('pick-btn')||ev.target.tagName==='LABEL') return;
+  fi.click();
+}});
+
+/* ─ タイマー ─ */
 let elapsed=0,timer=null;
-function startTimer(){elapsed=0;timer=setInterval(()=>{elapsed++;pmsg.innerHTML='生成中… <strong>'+elapsed+'秒</strong> 経過<br>最大5分かかる場合があります。そのままお待ちください。';},1000);}
-function stopTimer(){if(timer){clearInterval(timer);timer=null;}}
-frm.onsubmit=async e=>{
+function startTimer(){{
+  elapsed=0;
+  timer=setInterval(()=>{{
+    elapsed++;
+    pmsg.innerHTML='最適化中… <strong>'+elapsed+'秒</strong> 経過<br>最大5分かかる場合があります。そのままお待ちください。';
+  }},1000);
+}}
+function stopTimer(){{if(timer){{clearInterval(timer);timer=null;}}}}
+
+/* ─ フォーム送信 ─ */
+frm.onsubmit=async e=>{{
   e.preventDefault();
-  if(!fi.files[0]){alert('ファイルを選択してください');return;}
+  if(!fi.files[0]){{alert('ファイルを選択してください');return;}}
   const fd=new FormData();fd.append('file',fi.files[0]);
   sw.style.display='block';ok.style.display='none';er.style.display='none';go.disabled=true;
   startTimer();
-  try{
-    const res=await fetch('/generate-shift',{method:'POST',body:fd});
+  try{{
+    const res=await fetch('/generate-shift',{{method:'POST',body:fd}});
     stopTimer();
-    if(res.ok){
+    if(res.ok){{
       const blob=await res.blob();
-      dl.href=URL.createObjectURL(blob);dl.download='Shift_Result.xlsx';
+      dl.href=URL.createObjectURL(blob);
+      dl.download=fi.files[0].name.replace(/[.](xlsx|xlsm|xls)$/i,'')+'_result.xlsx';
       sw.style.display='none';ok.style.display='block';
-    }else{
-      const j=await res.json().catch(()=>({}));
+    }}else{{
+      const j=await res.json().catch(()=>({{}}));
       throw new Error(j.detail||'サーバーエラーが発生しました');
-    }
-  }catch(ex){
+    }}
+  }}catch(ex){{
     stopTimer();sw.style.display='none';er.style.display='block';
-    er.textContent='❌ エラー:\\n'+ex.message;
-  }finally{go.disabled=false;}
-};
+    er.textContent='❌ エラー:\n'+ex.message;
+  }}finally{{go.disabled=false;}}
+}};
 </script>
 </body>
 </html>"""
@@ -1016,24 +1351,42 @@ frm.onsubmit=async e=>{
 async def index():
     return HTMLResponse(content=HTML_CONTENT)
 
+@app.get("/favicon.png")
+async def favicon_png():
+    if _favicon_path.exists():
+        return FileResponse(str(_favicon_path), media_type="image/png")
+    raise HTTPException(status_code=404, detail="favicon not found")
+
+@app.get("/favicon.ico")
+async def favicon_ico():
+    if _favicon_path.exists():
+        return FileResponse(str(_favicon_path), media_type="image/png")
+    raise HTTPException(status_code=404, detail="favicon not found")
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "4.0"}
+    return {"status": "ok", "version": "5.0"}
 
 @app.post("/generate-shift")
 async def generate(file: UploadFile = File(...)):
-    uid     = str(uuid.uuid4())
-    in_p    = os.path.join(TEMP_DIR, f"in_{uid}.xlsx")
-    out_p   = os.path.join(TEMP_DIR, f"out_{uid}.xlsx")
+    uid  = str(uuid.uuid4())
+    # 入力ファイルの拡張子を保持（xlsm対応）
+    orig_name = file.filename or "upload.xlsx"
+    ext  = os.path.splitext(orig_name)[1].lower()
+    if ext not in [".xlsx", ".xls", ".xlsm"]:
+        ext = ".xlsx"
+    in_p  = os.path.join(TEMP_DIR, f"in_{uid}{ext}")
+    out_p = os.path.join(TEMP_DIR, f"out_{uid}.xlsx")
     try:
         with open(in_p, "wb") as f:
             shutil.copyfileobj(file.file, f)
         (result, staff, shuunin_list, unit_map, cont_map, role_map,
-         days_norm, requests, ab_unit_result, shuunin_unit_result) = generate_shift(in_p)
+         days_norm, requests, ab_unit_result, shuunin_unit_result,
+         kanmu_map) = generate_shift(in_p)
         write_shift_result(
             result, staff, shuunin_list, unit_map, cont_map, role_map,
             days_norm, requests, ab_unit_result, shuunin_unit_result,
-            in_p, out_p)
+            kanmu_map, in_p, out_p)
         return FileResponse(
             out_p, filename="Shift_Result.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1061,7 +1414,7 @@ if __name__ == "__main__":
         threading.Thread(target=open_browser, daemon=True).start()
 
     print("=" * 50)
-    print(" シフト表自動作成アプリ v4.0")
+    print(" シフト表自動作成アプリ v5.0")
     print(f" http://localhost:{port}")
     print("=" * 50)
     uvicorn.run("main:app", host=host, port=port, reload=False)
