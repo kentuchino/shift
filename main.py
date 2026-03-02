@@ -716,7 +716,7 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
       - 主任の早         → A早 or B早
       - 夜/×/有/日      → そのまま
     """
-    wb = load_workbook(input_path, keep_vba=True if input_path.endswith(".xlsm") else False)
+    wb = load_workbook(input_path, data_only=True, keep_vba=False)
     if "shift_result" in wb.sheetnames:
         del wb["shift_result"]
     ws = wb.create_sheet("shift_result")
