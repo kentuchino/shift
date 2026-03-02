@@ -1044,13 +1044,89 @@ HTML_CONTENT = """
 
         .loader { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; display: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
+
+
+        /* --- メインタイトルエリア --- */
+        .main-header {
+            padding: 30px 40px 10px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            animation: fadeInSlide 1s ease-out;
+        }
+
+        .logo-symbol {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 20px rgba(0, 102, 255, 0.4);
+        }
+
+        .brand-title {
+            font-size: 1.8rem;
+            font-weight: 800;
+            background: linear-gradient(to right, #fff, var(--text-dim));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        .brand-subtitle {
+            font-family: 'JetBrains Mono';
+            font-size: 0.75rem;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            margin-left: 2px;
+            opacity: 0.8;
+        }
+
+        .header-line {
+            width: 100%;
+            max-width: 640px;
+            height: 1px;
+            background: linear-gradient(to right, var(--primary), transparent);
+            margin-top: 15px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header-line::after {
+            content: '';
+            position: absolute;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(to right, transparent, var(--accent), transparent);
+            animation: lineScan 3s infinite linear;
+        }
+
+        @keyframes fadeInSlide {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        @keyframes lineScan {
+            0% { left: -100%; }
+            100% { left: 100%; }
+        }
     </style>
 </head>
 <body>
 
 <aside class="panel">
-    <div class="header-logo">SHIFT GENIUS</div>
-    <div class="version-tag">最適化エンジン 第4世代</div>
+    
 
     <div class="section-label">システム正常性</div>
     <div class="info-card">
@@ -1074,7 +1150,18 @@ HTML_CONTENT = """
 </aside>
 
 <main class="main">
-    <div class="top-bar">メインコンソール > 自動シフト生成</div>
+   <header class="main-header">
+        <div class="logo-container">
+            <div class="logo-symbol">
+                <i data-lucide="cpu" color="#fff" size="24"></i>
+            </div>
+            <div>
+                <div class="brand-title">SHIFT GENIUS <span style="font-weight:300;">PRO</span></div>
+                <div class="brand-subtitle">AI-Powered Optimization Engine</div>
+            </div>
+        </div>
+        <div class="header-line"></div>
+    </header>
     
     <div class="workspace">
         <div id="dropZone" class="drop-area">
@@ -1099,6 +1186,11 @@ HTML_CONTENT = """
 <aside class="panel panel-right">
     <div class="section-label">最適化メトリクス</div>
     <div class="info-card">
+        <span class="info-label">経過時間（ライブ）</span>
+        <div class="info-value" id="elapsedTime">0.00秒</div>
+    </div>
+    
+    <div class="info-card">
         <span class="info-label">計算適合率（精度）</span>
         <div class="info-value" id="scoreValue" style="color:var(--accent);">--</div>
         <div class="bar-container"><div class="bar-fill" id="scoreBar"></div></div>
@@ -1118,13 +1210,13 @@ HTML_CONTENT = """
         <div class="rule-item"><span>6. 役職者配置ルール</span><div class="status-light" id="L6"></div></div>
     </div>
 
-    <div class="section-label">実行履歴</div>
-    <div id="historyLogs" style="font-size:0.75rem; color:var(--text-dim);">履歴なし</div>
+    
 </aside>
 
 <script>
     lucide.createIcons();
     let targetFile = null;
+    let timerInterval = null; // タイマーをグローバルで管理
 
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
@@ -1153,7 +1245,6 @@ HTML_CONTENT = """
         document.getElementById('filePrompt').textContent = `準備完了: ${file.name}`;
         document.getElementById('filePrompt').style.color = 'var(--accent)';
         
-        // ファイル診断（擬似）
         document.getElementById('fileInspector').innerHTML = `
             <div class="info-card">
                 <span class="info-label">対象ファイル名</span>
@@ -1167,22 +1258,39 @@ HTML_CONTENT = """
         addLog(`ファイルを読み込みました: ${file.name}`);
     }
 
-    function addLog(msg) {
+    function addLog(msg, color = 'inherit') {
         const div = document.createElement('div');
         div.className = 'log-row';
+        div.style.color = color;
         div.textContent = `> [${new Date().toLocaleTimeString()}] ${msg}`;
         logBody.appendChild(div);
-        document.getElementById('logMonitor').scrollTop = document.getElementById('logMonitor').scrollHeight;
+        const monitor = document.getElementById('logMonitor');
+        monitor.scrollTop = monitor.scrollHeight;
     }
 
     runBtn.addEventListener('click', async () => {
         if (!targetFile) return;
 
+        // 初期化
         runBtn.disabled = true;
         document.getElementById('loader').style.display = 'block';
         document.getElementById('btnLabel').textContent = '最適化実行中...';
         laser.style.display = 'block';
         
+        // --- 経過時間タイマー開始 ---
+        const startTime = performance.now();
+        const elapsedDisplay = document.getElementById('elapsedTime');
+        const timeValueDisplay = document.getElementById('timeValue');
+        
+        // 以前のタイマーがあればクリア
+        if(timerInterval) clearInterval(timerInterval);
+        
+        timerInterval = setInterval(() => {
+            const now = performance.now();
+            const diff = ((now - startTime) / 1000).toFixed(2);
+            elapsedDisplay.textContent = diff + '秒';
+        }, 50);
+
         // システム負荷演出
         document.getElementById('loadStatus').textContent = '高負荷';
         document.getElementById('loadBar').style.width = '98%';
@@ -1190,24 +1298,25 @@ HTML_CONTENT = """
 
         // ルール点灯演出
         const lights = ['L1','L2','L3','L4','L5','L6'].map(id => document.getElementById(id));
-        const timer = setInterval(() => {
+        const lightTimer = setInterval(() => {
             lights.forEach(l => l.className = Math.random() > 0.5 ? 'status-light light-active' : 'status-light');
         }, 200);
 
         addLog("最適化モデルを初期化中...");
         addLog("制約条件のマッピングを開始...");
         
-        const startTime = performance.now();
         const fd = new FormData();
         fd.append("file", targetFile);
 
         try {
             const res = await fetch("/generate-shift", {method: "POST", body: fd});
             if (res.ok) {
-                const duration = ((performance.now() - startTime) / 1000).toFixed(2);
-                document.getElementById('timeValue').textContent = `${duration}秒`;
+                // 完了時の処理
+                const finalTime = ((performance.now() - startTime) / 1000).toFixed(2);
+                timeValueDisplay.textContent = `${finalTime}秒`;
                 document.getElementById('scoreValue').textContent = '99.8%';
                 document.getElementById('scoreBar').style.width = '99.8%';
+                
                 addLog("最適解の構築が成功しました。");
                 
                 const blob = await res.blob();
@@ -1218,7 +1327,10 @@ HTML_CONTENT = """
         } catch (e) {
             addLog("致命的エラー: 制約条件が矛盾しているか、データが不正です。", "#ff4d4d");
         } finally {
-            clearInterval(timer);
+            // タイマー停止
+            clearInterval(timerInterval);
+            clearInterval(lightTimer);
+            
             lights.forEach(l => l.className = 'status-light');
             runBtn.disabled = false;
             document.getElementById('loader').style.display = 'none';
