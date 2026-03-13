@@ -1,18 +1,3 @@
-"""
-シフト表自動作成アプリ v5.3
-新機能:
-  - Staff_Masterのユニット列をA/Bのみに制限
-  - ユニット兼務（◯✕）列を追加：兼務職員が他ユニット勤務時はA早/B早/A遅/B遅で表示
-  - 集計行にCOUNTIF数式（A早/B早/A遅/B遅/夜勤）を使用
-  - 主任のシフトをA早/B早で表示
-  - favicon.pngをファビコンとして使用
-  - .xlsmファイルの選択・アップロードに対応
-  - WebUIを全面リデザイン（ロゴ・アニメーション強化）
-v5.1追加:
-  - 夜勤翌日の休みを「○」、通常公休を「×」に区別
-  - ソフト制約: 遅出翌日の日勤を極力回避
-  - ソフト制約: ×/有の間隔を10日以内に調整
-"""
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 import pandas as pd
@@ -59,8 +44,10 @@ if _favicon_path.exists():
 # Settings 読み込み
 # ========================================================
 def load_settings(df):
+
     start, end = None, None
     holidays = {}
+    nenkyuu = {}
     header_row = None
     for i in range(len(df)):
         v = str(df.iloc[i, 0]).strip()
@@ -71,16 +58,22 @@ def load_settings(df):
         raise Exception("Settingsシートに期間ヘッダーが見つかりません")
 
     for j in range(header_row + 1, len(df)):
-        s = pd.to_datetime(df.iloc[j, 0], errors="coerce")
-        e = pd.to_datetime(df.iloc[j, 1], errors="coerce")
+        s_val = pd.to_datetime(df.iloc[j, 0], errors="coerce")
+        e_val = pd.to_datetime(df.iloc[j, 1], errors="coerce")
         c = str(df.iloc[j, 2]).strip()
         n_str = str(df.iloc[j, 3]).strip()
-        if pd.isna(s) and pd.isna(e) and c in ["nan", "None", ""]:
+        # 列4が年休数（新レイアウト）、存在しない場合は空文字
+        try:
+            nen_str = str(df.iloc[j, 4]).strip() if df.shape[1] > 4 else ""
+        except Exception:
+            nen_str = ""
+        if pd.isna(s_val) and pd.isna(e_val) and c in ["nan", "None", ""]:
             continue
-        if pd.notna(s):
-            start = s if start is None else min(start, s)
-        if pd.notna(e):
-            end = e if end is None else max(end, e)
+        if pd.notna(s_val):
+            start = s_val if start is None else min(start, s_val)
+        if pd.notna(e_val):
+            end = e_val if end is None else max(end, e_val)
+        # 公休数（列3）
         m = re.search(r"\d+", n_str)
         if m and c not in ["nan", "None", ""]:
             num = int(m.group())
@@ -90,6 +83,20 @@ def load_settings(df):
                 holidays["32h"] = holidays.get("32h", 0) + num
             elif "パート" in c:
                 holidays["パート"] = holidays.get("パート", 0) + num
+        # 年休数（列4）
+        nen_m = re.search(r"\d+", nen_str)
+        if nen_m and c not in ["nan", "None", ""]:
+            nen_num = int(nen_m.group())
+            if "40" in c:
+                # 同一契約区分で複数行ある場合、最初の非零値を採用
+                if nenkyuu.get("40h", 0) == 0:
+                    nenkyuu["40h"] = nen_num
+            elif "32" in c:
+                if nenkyuu.get("32h", 0) == 0:
+                    nenkyuu["32h"] = nen_num
+            elif "パート" in c:
+                if nenkyuu.get("パート", 0) == 0:
+                    nenkyuu["パート"] = nen_num
 
     if start is None or end is None:
         raise Exception("期間が取得できませんでした")
@@ -97,13 +104,17 @@ def load_settings(df):
     holidays.setdefault("40h", 9)
     holidays.setdefault("32h", 8)
     holidays.setdefault("パート", 0)
+    # 年休デフォルト（Settingsに記載がない場合は従来の2日）
+    nenkyuu.setdefault("40h", 2)
+    nenkyuu.setdefault("32h", 2)
+    nenkyuu.setdefault("パート", 0)
 
     days = []
     d = start
     while d <= end:
         days.append(d)
         d += timedelta(days=1)
-    return days, holidays
+    return days, holidays, nenkyuu
 
 
 # ========================================================
@@ -142,15 +153,19 @@ def load_requests(df, days, staff_list, part_staff=None):
                 continue
             if "×" in raw or "休み" in raw:
                 requests[name][date] = ("×", "希望")
-            elif "有給" in raw or raw == "有":
+            elif "有給" in raw or raw in ("有", "年") or "年休" in raw:
+                # 新略称「年」「年休」も有給として認識
                 requests[name][date] = ("有", "指定" if is_part else "希望")
             elif "夜勤" in raw or raw == "夜":
                 requests[name][date] = ("夜", "指定")
-            elif "早出" in raw or raw == "早":
+            elif "早出" in raw or raw in ("早", "ハ"):
+                # 新略称「ハ」も早出として認識
                 requests[name][date] = ("早", "指定")
-            elif "遅出" in raw or raw == "遅":
+            elif "遅出" in raw or raw in ("遅", "オ"):
+                # 新略称「オ」も遅出として認識
                 requests[name][date] = ("遅", "指定")
-            elif "日勤" in raw or raw == "日":
+            elif "日勤" in raw or raw in ("日", "ニ"):
+                # 新略称「ニ」も日勤として認識
                 requests[name][date] = ("日", "指定")
     return requests
 
@@ -181,11 +196,12 @@ def load_prev_month(df, staff_list):
         seq = []
         for j in date_cols:
             raw = str(df.iloc[i, j]).strip()
-            if "夜勤" in raw or raw == "夜":   seq.append("夜")
-            elif "早出" in raw or raw == "早": seq.append("早")
-            elif "遅出" in raw or raw == "遅": seq.append("遅")
-            elif "日勤" in raw or raw == "日": seq.append("日")
-            else:                              seq.append("×")
+            if "夜勤" in raw or raw == "夜":                          seq.append("夜")
+            elif "早出" in raw or raw in ("早", "ハ"):                seq.append("早")
+            elif "遅出" in raw or raw in ("遅", "オ"):                seq.append("遅")
+            elif "日勤" in raw or raw in ("日", "ニ"):                seq.append("日")
+            elif "有給" in raw or raw in ("有", "年") or "年休" in raw: seq.append("有")
+            else:                                                      seq.append("×")
         prev[name] = seq
     return prev
 
@@ -201,8 +217,179 @@ def count_trailing_consec(shift_seq):
 
 
 # ========================================================
-# メインシフト生成
+# INFEASIBLE 診断ヘルパー
 # ========================================================
+def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
+                         allowed_shifts_map, fixed_holiday_map, holiday_limits,
+                         cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
+                         unit_map=None, ab_staff_set=None):
+
+    msgs = []
+    seen = set()
+
+    def add_msg(m):
+        if m not in seen:
+            seen.add(m)
+            msgs.append(m)
+
+    SHIFT_NAME = {
+        "早": "早出(ハ)", "遅": "遅出(オ)", "日": "日勤(ニ)",
+        "夜": "夜勤", "×": "休み(×)", "有": "年休(有)", "○": "明け(○)"
+    }
+    # 「指定」で許可されるシフト（備考制限外でも可）
+    ALLOWED_SPECIFIED = {"早", "遅", "夜"}
+
+    # ── 1. 備考制限と希望シフトの矛盾（一般・パートスタッフのみ）──
+    # 「指定」の場合は早出・遅出・夜勤のいずれかなら備考制限を超えてもOK
+    # 主任はCheck 2 で専用処理するためここでは除外
+    for s in staff:
+        allowed = allowed_shifts_map.get(s)
+        if allowed is None:
+            continue
+        forbidden_reqs = []
+        for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
+            if sh_type not in ["早","遅","日","夜"]:
+                continue
+            is_in_allowed = sh_type in allowed
+            is_allowed_specified = (req_type == "指定" and sh_type in ALLOWED_SPECIFIED)
+            if not is_in_allowed and not is_allowed_specified and req_type == "指定":
+                forbidden_reqs.append(
+                    f"{date_obj.strftime('%m/%d')}({SHIFT_NAME.get(sh_type,sh_type)})指定")
+        if forbidden_reqs:
+            allowed_names = ",".join(SHIFT_NAME.get(a, a) for a in sorted(allowed))
+            days_str = ", ".join(forbidden_reqs)
+            add_msg(
+                f"致命的エラー: {s}さんの 希望シフト・希望休の制約条件が矛盾しているか、データが不正です。\n"
+                f"  備考制限: 許可勤務は [{allowed_names}] のみ（指定で 早出・遅出・夜勤 は可）\n"
+                f"  矛盾する指定: {days_str}\n"
+                f"  → Shift_Requestsシートで該当日の指定を 早出(ハ)・遅出(オ)・夜勤・休み(×) に変更してください。"
+            )
+
+    # ── 2. 主任への不正シフト指定（遅・夜の指定はOK、日・有・○は不可）──
+    for s in shuunin_list:
+        bad_reqs = []
+        for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
+            if sh_type in ["遅","夜"] and req_type == "指定":
+                continue  # 遅出・夜勤の指定はOK
+            if sh_type in ["日","有","○"] and req_type == "指定":
+                bad_reqs.append(
+                    f"{date_obj.strftime('%m/%d')}({SHIFT_NAME.get(sh_type,sh_type)})指定")
+        if bad_reqs:
+            days_str = ", ".join(bad_reqs)
+            add_msg(
+                f"致命的エラー: {s}さん（主任）への指定が矛盾しています。\n"
+                f"  主任は 早出(ハ)・遅出(オ)・夜勤・休み(×) のみ指定可能です。\n"
+                f"  矛盾する指定: {days_str}\n"
+                f"  → Shift_Requestsシートで該当日を早出(ハ)・遅出(オ)・夜勤・休み(×)に変更してください。"
+            )
+
+    # ── 3. 公休数との矛盾（希望休の数が設定公休数を超える）──
+    for s in staff:
+        hol_limit = holiday_limits.get(cont_map.get(s, "40h"), 0)
+        if hol_limit == 0:
+            continue
+        hope_off_days = sum(
+            1 for _date_obj, (sh_type, req_type) in requests.get(s, {}).items()
+            if sh_type in ["×", "有"] and req_type == "希望"
+        )
+        if hope_off_days > hol_limit:
+            add_msg(
+                f"致命的エラー: {s}さん の 希望休の数({hope_off_days}日) が "
+                f"設定公休数({hol_limit}日) を超えているため、スケジュールを確定できません。\n"
+                f"  → 希望休を{hol_limit}日以内に絞るか、公休数設定を見直してください。"
+            )
+
+    # ── 4. 夜勤設定との矛盾（夜勤上限と公休数のバランス）──
+    for s in staff:
+        hol = holiday_limits.get(cont_map.get(s, "40h"), 0)
+        nmin = nmin_map.get(s, 0)
+        nmax = nmax_map.get(s, 0)
+        prev_seq = prev_month.get(s, [])
+        prev_night = (bool(prev_seq) and prev_seq[-1] == "夜")
+        max_maru = nmax + (1 if prev_night else 0)
+        if hol > 0 and max_maru > hol:
+            add_msg(
+                f"致命的エラー: {s}さん の 夜勤上限回数と公休数のバランスが取れていません"
+                f"（夜勤の翌日は休みになるため、勤務できる日数が足りません）。\n"
+                f"  公休{hol}日 に対し 夜勤上限{nmax}回"
+                + ("＋前月末夜勤(+1)" if prev_night else "")
+                + f" = ○{max_maru}日必要ですが、×が{max_maru - hol}日不足します。\n"
+                f"  → 夜勤上限を{hol - (1 if prev_night else 0)}以下にするか、"
+                f"公休数を{max_maru}以上に増やしてください。"
+            )
+        if nmin > N:
+            add_msg(
+                f"致命的エラー: {s}さんの 夜勤最少数({nmin}回) が 対象日数({N}日) を超えています。\n"
+                f"  → 夜勤最少数を{N}以下に設定してください。"
+            )
+
+    # ── 5. 夜勤可能スタッフ全体の夜勤数チェック ──
+    night_capable = [s for s in staff if nmax_map.get(s, 0) > 0]
+    total_nmax = sum(nmax_map[s] for s in night_capable)
+    total_nmin = sum(nmin_map[s] for s in night_capable)
+    if total_nmin > N:
+        names = ", ".join(f"{s}({nmin_map[s]}回)" for s in night_capable)
+        add_msg(
+            f"致命的エラー: 夜勤可能スタッフ全員の夜勤最少数合計({total_nmin}回) が "
+            f"対象日数({N}日) を超えています。\n"
+            f"  [{names}]\n"
+            f"  → 夜勤最少数の合計が{N}以下になるよう各職員の設定を見直してください。"
+        )
+    if total_nmax < N:
+        names = ", ".join(f"{s}({nmax_map[s]}回)" for s in night_capable)
+        add_msg(
+            f"致命的エラー: 夜勤可能スタッフ全員の夜勤最高数合計({total_nmax}回) が "
+            f"対象日数({N}日) より少ないです。\n"
+            f"  [{names}]\n"
+            f"  → 夜勤最高数の合計が{N}以上になるよう各職員の設定を見直してください。"
+        )
+
+    # ── 6. 人数不足チェック（各日の早出カバレッジ簡易確認）──
+    if unit_map is not None and days_norm:
+        _ab_set = ab_staff_set or set()
+        for d, dn in enumerate(days_norm):
+            date_str = f"{dn.month}月{dn.day}日"
+            a_avail = []
+            b_avail = []
+            for s in staff:
+                req = requests.get(s, {}).get(dn)
+                fixed_off = (dn.weekday() in (fixed_holiday_map.get(s) or set()))
+                is_req_off = (req and req[0] in ["×", "有"] and req[1] == "指定")
+                if fixed_off or is_req_off:
+                    continue
+                u = unit_map.get(s, "")
+                is_ab = (s in _ab_set)
+                if u == "A" or is_ab:
+                    a_avail.append(s)
+                if u == "B" or is_ab:
+                    b_avail.append(s)
+            if len(a_avail) < 1:
+                add_msg(
+                    f"致命的エラー: {date_str} の Aユニット・早出 の必要人数(1名)に対して、"
+                    f"出勤可能なスタッフが不足しています。\n"
+                    f"  → {date_str}前後の希望休・固定休を見直してください。"
+                )
+            if len(b_avail) < 1:
+                add_msg(
+                    f"致命的エラー: {date_str} の Bユニット・早出 の必要人数(1名)に対して、"
+                    f"出勤可能なスタッフが不足しています。\n"
+                    f"  → {date_str}前後の希望休・固定休を見直してください。"
+                )
+
+    # ── 7. パート職員の年休希望チェック ──
+    for s in [s2 for s2 in staff if cont_map.get(s2) == "パート"]:
+        warn_days = []
+        for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
+            if sh_type == "有" and req_type == "希望":
+                warn_days.append(date_obj.strftime("%m/%d"))
+        if warn_days:
+            add_msg(
+                f"警告: {s}さん（パート）の年休(有)希望は無視されます。\n"
+                f"  対象日: {', '.join(warn_days)}\n"
+                f"  → '指定'に変更するか、空白にしてください。"
+            )
+
+    return msgs
 def generate_shift(file_path):
     xls = pd.ExcelFile(file_path)
     staff_df    = xls.parse("Staff_Master",   header=None)
@@ -281,7 +468,7 @@ def generate_shift(file_path):
     part_staff = [s for s in staff if cont_map[s] == "パート"]
 
     # 設定・希望・前月
-    days, holiday_limits = load_settings(settings_df)
+    days, holiday_limits, nenkyuu_limits = load_settings(settings_df)
     N = len(days)
     all_names_for_req = all_staff_names  # 主任も希望シフト対象
     requests   = load_requests(request_df, days, all_names_for_req, part_staff=part_staff)
@@ -297,6 +484,53 @@ def generate_shift(file_path):
     allowed_shifts_map = {}
     weekly_work_days   = {}
     part_with_fixed = set()
+
+    # 備考の曜日別シフト指定を解析するヘルパー
+    # 例: "日曜：夜勤か×" / "水曜：早出" / "金曜：×か遅出"
+    SHIFT_KEYWORD_MAP = {
+        "早出": "早", "早": "早", "ハ": "早",
+        "遅出": "遅", "遅": "遅", "オ": "遅",
+        "夜勤": "夜", "夜": "夜",
+        "日勤": "日", "日": "日", "ニ": "日",
+        "×": "×", "休み": "×",
+        "有給": "有", "年休": "有", "有": "有",
+        "○": "○",
+    }
+
+    def parse_weekday_note(note):
+        """
+        備考文字列から {曜日番号: {許可シフトセット}} を返す。
+        例: "日曜：夜勤か×、水曜：早出" → {6: {"夜","×"}, 2: {"早"}}
+        """
+        wd_map = {}
+        # パターン: 「曜日名:シフト1かシフト2...」
+        for seg in re.split(r"[,、。\n]+", note):
+            seg = seg.strip()
+            m = re.match(
+                r"([月火水木金土日](?:曜(?:日)?)?)[:：](.+)", seg)
+            if not m:
+                continue
+            wd_str = m.group(1)
+            shifts_str = m.group(2)
+            # 曜日番号
+            base = wd_str.replace("曜日","").replace("曜","")
+            wd_num = WEEKDAY_MAP.get(base) if base in WEEKDAY_MAP else WEEKDAY_MAP.get(wd_str)
+            if wd_num is None:
+                continue
+            # シフト解析
+            allowed_set = set()
+            for token in re.split(r"[かまたは/／・\s]+", shifts_str):
+                token = token.strip()
+                for kw, sh in SHIFT_KEYWORD_MAP.items():
+                    if kw in token:
+                        allowed_set.add(sh)
+                        break
+            if allowed_set:
+                wd_map[wd_num] = allowed_set
+        return wd_map
+
+    # 職員ごとの備考から曜日シフト制約マップを作成
+    weekday_shift_map = {}  # {staff_name: {weekday_int: set_of_allowed_shifts}}
 
     for s in all_staff_names:
         note = note_map.get(s, "")
@@ -314,6 +548,11 @@ def generate_shift(file_path):
         if m:
             weekly_work_days[s] = int(m.group(1))
 
+        # 曜日別シフト制約
+        wd_sh = parse_weekday_note(note)
+        if wd_sh:
+            weekday_shift_map[s] = wd_sh
+
     for s in part_staff:
         req_s = requests.get(s, {})
         designated = sum(1 for v in req_s.values() if v[1] == "指定" and v[0] in WORK_SHIFTS)
@@ -327,6 +566,27 @@ def generate_shift(file_path):
         week_sun   = dn - timedelta(days=sun_offset)
         week_groups[week_sun.strftime("%Y-%m-%d")].append(d_idx)
     sorted_week_keys = sorted(week_groups.keys())
+
+    # ── SettingsのD/E列1-2行目から指定曜日日勤配置を読み込む ──
+    # D1/E1: ヘッダー（「指定曜日日勤配置」など）、D2/E2: 曜日名
+    nikkin_weekdays = []
+    try:
+        for col_idx in [3, 4]:
+            if settings_df.shape[1] > col_idx and settings_df.shape[0] > 1:
+                h_val = str(settings_df.iloc[0, col_idx]).strip()
+                d_val = str(settings_df.iloc[1, col_idx]).strip()
+                if any(kw in h_val for kw in ["指定", "日勤", "配置"]):
+                    for wd_s in re.split(r"[,、・\s/／]+", d_val):
+                        wd_s = wd_s.strip()
+                        if wd_s in WEEKDAY_MAP:
+                            wd_n = WEEKDAY_MAP[wd_s]
+                            if wd_n not in nikkin_weekdays:
+                                nikkin_weekdays.append(wd_n)
+    except Exception:
+        pass
+
+    # nikkin日（指定曜日日勤配置が適用されるday index集合）
+    nikkin_days_idx = {d for d, dn in enumerate(days_norm) if dn.weekday() in nikkin_weekdays}
 
     # ── 兼務職員（ユニット兼務=○）──
     ab_staff = [s for s in staff if kanmu_map.get(s, "×") == "○"]
@@ -392,13 +652,16 @@ def generate_shift(file_path):
     fix_requests(x, staff)
     fix_requests(xs, shuunin_list)
 
-    # ── 制約3: 前月最終日が夜勤 → 1日目は○（夜勤明け休）──
+    # ── 制約3: 前月最終日が夜勤 → 1日目は○か有（年休）のみ──
+    # ○が夜勤数を超える場合は有給（年休）を使用（月2日まで）
     for s in staff:
         if prev_month.get(s, []) and prev_month[s][-1] == "夜":
-            model.Add(x[s,0,"○"] == 1)
+            # 1日目は勤務(早遅日夜)・×は禁止 → ○か有のみ
+            for sh_f in ["早","遅","日","夜","×"]:
+                model.Add(x[s,0,sh_f] == 0)
     for s in shuunin_list:
         if prev_month.get(s, []) and prev_month[s][-1] == "夜":
-            model.Add(xs[s,0,"○"] == 1)
+            model.Add(xs[s,0,"○"] == 1)  # 主任は夜勤なしなのでこのケースは実質発生しない
 
     # ── 制約4: 固定公休（曜日指定）──
     for s, wdays in fixed_holiday_map.items():
@@ -435,19 +698,29 @@ def generate_shift(file_path):
                [ulb[s,d] for s in ab_staff])
         model.Add(sum(b_l) == 1)
 
-        # 夜勤（主任は夜勤なし）
-        model.Add(sum(x[s,d,"夜"] for s in staff) == 1)
+        # 夜勤（主任が夜勤指定の日はその主任の変数もカウントに含める）
+        shuunin_night_vars_d = [xs[s,d,"夜"] for s in shuunin_list
+                                if requests.get(s,{}).get(days_norm[d])
+                                and requests[s][days_norm[d]][0] == "夜"
+                                and requests[s][days_norm[d]][1] == "指定"]
+        model.Add(sum(x[s,d,"夜"] for s in staff) + sum(shuunin_night_vars_d) == 1)
 
     # ── 制約6: 夜勤回数 ──
     for s in staff:
         nt = sum(x[s,d,"夜"] for d in range(N))
         model.Add(nt >= nmin_map[s])
         model.Add(nt <= nmax_map[s])
+    # 主任は原則夜勤なし、ただし「指定」がある場合のみ許可
     for s in shuunin_list:
         for d in range(N):
+            req = requests.get(s, {}).get(days_norm[d])
+            if req and req[0] == "夜" and req[1] == "指定":
+                continue  # 夜勤指定はOK
             model.Add(xs[s,d,"夜"] == 0)
 
     # ── 制約7: 夜勤→翌日は○（夜勤明け休）──
+    # (penalty_terms はソフト制約で使用するため、ここで初期化しておく)
+    penalty_terms = []
     cn_vars = {}
     for s in staff:
         can_consec = (consec_night_map.get(s, "×") == "○")
@@ -462,7 +735,14 @@ def generate_shift(file_path):
                 model.AddBoolOr([x[s,d,"夜"].Not(), x[s,d+1,"夜"].Not()]).OnlyEnforceIf(cn.Not())
                 if d + 3 < N:
                     model.Add(x[s,d+2,"○"] == 1).OnlyEnforceIf(cn)
-                    model.Add(x[s,d+3,"○"] == 1).OnlyEnforceIf(cn)
+                    # d+3: 日勤は絶対禁止。早/遅/夜は「どうしても必要な場合」のみ
+                    # ソフト制約（超高ペナルティ）で緊急時のみ許容
+                    model.Add(x[s,d+3,"日"] == 0).OnlyEnforceIf(cn)
+                    for sh_w in ["早","遅","夜"]:
+                        _v3 = model.NewBoolVar(f"cd3_{s}_{d}_{sh_w}")
+                        model.AddBoolAnd([cn, x[s,d+3,sh_w]]).OnlyEnforceIf(_v3)
+                        model.AddBoolOr([cn.Not(), x[s,d+3,sh_w].Not()]).OnlyEnforceIf(_v3.Not())
+                        penalty_terms.append((_v3, 800))  # 非常に高いペナルティ
                 elif d + 2 < N:
                     model.Add(x[s,d+2,"○"] == 1).OnlyEnforceIf(cn)
                 if d + 2 < N:
@@ -487,6 +767,16 @@ def generate_shift(file_path):
                     model.Add(x[s, 0, "○"] == 0)
             else:
                 model.Add(x[s, d, "○"] == 0).OnlyEnforceIf(x[s, d-1, "夜"].Not())
+
+    # ── 制約7-3: 主任の○は前日夜勤のみ（夜勤なしの日は○禁止）──
+    for s in shuunin_list:
+        for d in range(N):
+            if d == 0:
+                prev_seq = prev_month.get(s, [])
+                if not (prev_seq and prev_seq[-1] == "夜"):
+                    model.Add(xs[s, 0, "○"] == 0)
+            else:
+                model.Add(xs[s, d, "○"] == 0).OnlyEnforceIf(xs[s, d-1, "夜"].Not())
 
     # ── 制約8: 遅→翌早禁止 ──
     for s in staff:
@@ -530,19 +820,40 @@ def generate_shift(file_path):
             model.Add(total_off >= min_hol)
             model.Add(total_off <= min_hol)  # 多くても少なくてもダメ（等式）
 
-    # ── 制約12: 備考による勤務制限 ──
+    # ── 制約12: 備考による勤務制限（月間全般制限 + 曜日別制限）──
+    # Shift_Requestsの「指定」は備考制限より優先される
     for s in all_staff_names:
         allowed = allowed_shifts_map.get(s)
-        if allowed is None:
-            continue
-        forbidden = set(WORK_SHIFTS) - allowed
         var_d = xs if s in shuunin_list else x
-        for d in range(N):
-            for sh in forbidden:
+        # 月間全般の勤務制限
+        if allowed is not None:
+            forbidden = set(WORK_SHIFTS) - allowed
+            for d in range(N):
                 req = requests.get(s, {}).get(days_norm[d])
-                if req and req[0] == sh and req[1] == "指定":
+                for sh in forbidden:
+                    # Shift_Requestsの「指定」が備考制限より優先
+                    if req and req[0] == sh and req[1] == "指定":
+                        continue
+                    model.Add(var_d[s,d,sh] == 0)
+        # 曜日別の勤務制限（備考に「日曜：夜勤か×」等の記述がある場合）
+        wd_sh_rules = weekday_shift_map.get(s, {})
+        if wd_sh_rules:
+            for d, dn in enumerate(days_norm):
+                wd = dn.weekday()
+                if wd not in wd_sh_rules:
                     continue
-                model.Add(var_d[s,d,sh] == 0)
+                req = requests.get(s, {}).get(dn)
+                # Shift_Requestsの「指定」が曜日制限より優先
+                if req and req[1] == "指定":
+                    continue
+                wd_allowed = wd_sh_rules[wd]
+                all_possible = set(ALL_SHIFTS)
+                wd_forbidden = all_possible - wd_allowed
+                for sh in wd_forbidden:
+                    if sh in ("○",):
+                        # ○は夜勤翌日のみ（制約7-2で管理）なのでスキップ
+                        continue
+                    model.Add(var_d[s,d,sh] == 0)
 
     # ── 制約13: パート職員に有給を自動割り当てしない ──
     for s in part_staff:
@@ -562,14 +873,28 @@ def generate_shift(file_path):
             req = requests.get(s, {}).get(days_norm[d])
             if req and req[0] == "有" and req[1] in ("指定", "希望"):
                 continue  # 明示的な希望・指定は許可
-            # 有給は夜勤翌日のみ許可（それ以外は禁止）
+            # 有給は夜勤翌日または前月末夜勤の翌日（1日目）のみ許可
             if d == 0:
                 prev_seq = prev_month.get(s, [])
                 if not (prev_seq and prev_seq[-1] == "夜"):
                     model.Add(x[s, 0, "有"] == 0)
+                # 前月末夜勤の場合は1日目は○か有のどちらでも可（制約3で早遅日夜×禁止済み）
             else:
                 # 前日が夜勤でない場合は有給禁止
                 model.Add(x[s, d, "有"] == 0).OnlyEnforceIf(x[s, d-1, "夜"].Not())
+
+    # ── 制約13-3: 一般職員の年休（有給）は Settingsの年休数（日数）を必ず取得 ──
+    # 年休は「出勤扱い」（連勤カウントに含まれる）のため公休数に含まれない
+    # Settings で指定した枚数は「一ヶ月に必ず消化しなければならない最低年休数」
+    for s in staff:
+        if s in part_staff:
+            continue
+        nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 2)
+        if nen_limit > 0:
+            total_nenkyuu = sum(x[s,d,"有"] for d in range(N))
+            model.Add(total_nenkyuu >= nen_limit)
+            # 上限も設ける（=ちょうど nen_limit 枚）
+            model.Add(total_nenkyuu <= nen_limit)
 
     # ── 制約14: パート職員の週単位勤務日数 ──
     for s in staff:
@@ -585,24 +910,54 @@ def generate_shift(file_path):
             else:
                 model.Add(sum(wv) <= round(target * len(didx) / 7 + 0.5))
 
-    # ── 制約15: 主任は早出か×のみ（○も禁止：主任は夜勤なしなので○は発生しない）──
+    # ── 制約15: 主任のシフト制限 ──
+    # 通常は早出か×のみ。ただし指定で遅出・夜勤は可。○は前日夜勤時のみ（制約7-3）。
+    # nikkin_weekday の日は日勤も許容（指定曜日日勤配置のフォールバック）。
     for s in shuunin_list:
         for d in range(N):
-            for sh in ["遅","夜","日","有","○"]:
-                req = requests.get(s, {}).get(days_norm[d])
-                if req and req[0] == sh and req[1] == "指定":
+            req = requests.get(s, {}).get(days_norm[d])
+            for sh in ["遅","夜","日","有"]:
+                # 指定での遅出・夜勤はOK
+                if sh in ["遅","夜"] and req and req[0] == sh and req[1] == "指定":
+                    continue
+                # nikkin_weekday では日勤も許容（フォールバック）
+                if sh == "日" and d in nikkin_days_idx:
                     continue
                 model.Add(xs[s,d,sh] == 0)
+            # ○は制約7-3で管理（前日夜勤のみ許可）
 
     # ======================================================
     # ソフト制約 & 目的関数
     # ======================================================
-    penalty_terms = []
+    # (penalty_terms は制約7内で初期化済み)
+
+    # ── 制約16: 指定曜日日勤配置（Settings D/E列）──
+    # Shift_Requests に日勤指定がある職員とは「別」に、1名日勤を追加配置する
+    for d, dn in enumerate(days_norm):
+        if dn.weekday() not in nikkin_weekdays:
+            continue
+        # Shift_Requestsで既に日勤「指定」の職員
+        req_nikkin = {s for s in staff
+                      if requests.get(s, {}).get(dn)
+                      and requests[s][dn][0] == "日"
+                      and requests[s][dn][1] == "指定"}
+        # 追加日勤対象: req_nikkin 以外の一般職員 + 主任（フォールバック）
+        extra_staff_vars   = [x[s,d,"日"]  for s in staff       if s not in req_nikkin]
+        extra_shuunin_vars = [xs[s,d,"日"] for s in shuunin_list]
+        # ハード: 一般職員か主任のどちらかが1名以上日勤
+        model.Add(sum(extra_staff_vars) + sum(extra_shuunin_vars) >= 1)
 
     # ── ソフト1: 主任使用ペナルティ ──
     for s in shuunin_list:
         for d in range(N):
             penalty_terms.append((xs[s,d,"早"], 200))
+
+    # ── ソフト: 指定曜日日勤配置での主任使用ペナルティ ──
+    for d, dn in enumerate(days_norm):
+        if dn.weekday() not in nikkin_weekdays:
+            continue
+        for s in shuunin_list:
+            penalty_terms.append((xs[s,d,"日"], 300))
 
     # ── ソフト2: 連続夜勤使用ペナルティ ──
     for (s, d), cn in cn_vars.items():
@@ -708,8 +1063,17 @@ def generate_shift(file_path):
     status = solver.Solve(model)
 
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        # ── INFEASIBLE診断: 誰の何が原因かを特定 ──
+        diag_msgs = _diagnose_infeasible(
+            staff, shuunin_list, requests, days_norm, N,
+            allowed_shifts_map, fixed_holiday_map, holiday_limits,
+            cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
+            unit_map=unit_map, ab_staff_set=ab_staff_set
+        )
+        if diag_msgs:
+            raise Exception("\n".join(diag_msgs))
         raise Exception(
-            "条件を満たすシフト表が見つかりませんでした。\n"
+            "致命的エラー: 条件を満たすシフト表が見つかりませんでした。\n"
             "希望シフト・夜勤回数・公休数の設定を見直してください。"
         )
 
@@ -768,84 +1132,98 @@ def generate_shift(file_path):
 def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map,
                        days_norm, requests, ab_unit_result, shuunin_unit_result,
                        kanmu_map, input_path, output_path, prev_month=None):
-    """
-    ユニット付き表示:
-      - 固定A職員の早/遅 → A早/A遅
-      - 固定B職員の早/遅 → B早/B遅
-      - 兼務職員の早/遅  → 割り当てユニット+早/遅 (例: B早, A遅)
-      - 主任の早         → A早 or B早
-      - 夜/×/有/日/○   → そのまま（○は夜勤明け休）
-    変更点 v5.3:
-      - shift_resultシートのみ出力（新規Workbook）
-      - 夜勤明け○の有給変換を後処理から削除（ソルバーが直接管理）
-      - 公休集計: ×+○ で計算（有給は出勤扱い）
-      - 有給列を追加
-      - 全セルに罫線追加（印刷対応）
-      - A4横向き印刷設定
-      - 公休数をSettingsの指定日数に厳密一致（ハード制約）
-    """
+
     from openpyxl import Workbook
+    from openpyxl.styles import Border, Side, PatternFill, Font, Alignment
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import CellIsRule
     from openpyxl.worksheet.page import PageMargins
 
     if prev_month is None:
         prev_month = {}
 
-    # ── 後処理: ○→有変換なし（v5.3: ソルバーが有給を直接管理）──
-    # 公休数の正確性を保つため、後処理変換は行わない
+    # ── Settings!B5（期間終了日）を読み込んで太罫線列を決定 ──
+    period_end_col_offset = None  # 0-based: day index of period end
+    try:
+        from openpyxl import load_workbook as _lw
+        _wb = _lw(input_path, keep_vba=True, data_only=True)
+        _ws = _wb['Settings']
+        _b5 = _ws['B5'].value
+        if _b5 is not None:
+            import pandas as _pd
+            _end_date = _pd.to_datetime(_b5).to_pydatetime().replace(
+                tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+            for _i, _d in enumerate(days_norm):
+                if _d.date() == _end_date.date():
+                    period_end_col_offset = _i  # 0-based index
+                    break
+    except Exception:
+        pass
+
+    # ── 後処理なし ──
     result_mod = {}
     all_disp_tmp = shuunin_list + staff
     for s in all_disp_tmp:
         result_mod[s] = dict(result.get(s, {}))
 
-    # shift_resultシートのみ含む新規Workbook
+    # ── Workbook 作成 ──
     wb = Workbook()
     ws = wb.active
     ws.title = "shift_result"
 
     N = len(days_norm)
-    weekday_ja = ["月","火","水","木","金","土","日"]
-    DATE_START_COL = 3
-    SUMMARY_COL    = DATE_START_COL + N
-    # 個人サマリー列: 早出/遅出/日勤/夜勤/公休/有給
-    SUMMARY_HDRS   = ["早出","遅出","日勤","夜勤","公休","有給"]
+    weekday_ja = ["月", "火", "水", "木", "金", "土", "日"]
+    DATE_START_COL = 2   # 列B = 1日目
+    SUMMARY_COL    = DATE_START_COL + N   # 集計列開始
+
+    # 集計列 (10列)
+    # SUMMARY_COL+0=早出, +1=日勤, +2=遅出, +3=夜勤, +4=計, +5=○, +6=×, +7=計, +8=年休, +9=合計
+    SUMM_ABBR  = ["ハ", "ニ", "オ", "夜勤", "", "", "", "", "年", ""]
+    SUMM_FULL  = ["早出", "日勤", "遅出", "夜勤", "計", "○", "×", "計", "年休", "合計"]
+    NUM_SUMM   = len(SUMM_FULL)
 
     # ── 罫線定義 ──
-    from openpyxl.styles import Border, Side
-    thin = Side(style="thin")
+    thin   = Side(style="thin")
     medium = Side(style="medium")
-    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_border = Border(left=thin, right=thin, top=medium, bottom=medium)
-    left_border = Border(left=medium, right=thin, top=thin, bottom=thin)
+    thin_border   = Border(left=thin,   right=thin,   top=thin,   bottom=thin)
+    header_border = Border(left=thin,   right=thin,   top=medium, bottom=medium)
 
-    all_disp_staff = shuunin_list + staff
-    STAFF_START_ROW  = 4
-    SHUUNIN_SEP_ROW  = STAFF_START_ROW + len(shuunin_list)
-    # sorted_staffを先に計算（COUNTIFレンジ計算のため）
-    def unit_order(s):
-        u = unit_map.get(s, "")
-        k = kanmu_map.get(s, "×")
-        if u == "A" and k != "○": return 0
-        if k == "○": return 1
-        if u == "B": return 2
-        return 3
-    sorted_staff = sorted(staff, key=unit_order)
-    LAST_STAFF_ROW = SHUUNIN_SEP_ROW + len(sorted_staff)
-    SUMMARY_ROW_BASE = LAST_STAFF_ROW + 2  # 空白1行を挟む
+    # ── 職員グループ分け（Staff_Master順を維持）──
+    all_staff_ordered = shuunin_list + staff
+    group1 = [s for s in all_staff_ordered if unit_map.get(s, "") != "B"]  # 非B(主任+A)
+    group2 = [s for s in all_staff_ordered if unit_map.get(s, "") == "B"]  # Bユニット
 
-    # ── ユニット付きシフト文字列を返すヘルパー（result_mod使用）──
+    STAFF_START_ROW = 5   # 行5から職員データ
+    last_group1_row  = STAFF_START_ROW + len(group1) - 1
+    first_group2_row = STAFF_START_ROW + len(group1)   # グループ1直後（区切りなし）
+    LAST_STAFF_ROW   = STAFF_START_ROW + len(group1) + len(group2) - 1
+
+    # 日別集計行（職員行の2行下から）
+    DAILY_ROW_BASE = LAST_STAFF_ROW + 2
+
+    # ── ユニット付きシフト文字列ヘルパー（v5.4: 略称変換付き）──
+    SHIFT_ABBR = {"早": "ハ", "遅": "オ", "日": "ニ", "有": "年"}
+
     def display_val(s, d):
         sh = result_mod[s].get(d, "×")
+        # 略称変換（夜/×/○はそのまま）
+        if sh == "日":
+            return "ニ"
+        if sh == "有":
+            return "年"
         if sh not in ("早", "遅"):
-            return sh
+            return sh  # 夜/×/○
+        # 早→ハ, 遅→オ（ユニットプレフィックス付き）
+        abbr = SHIFT_ABBR[sh]
         if s in shuunin_list:
             unit = shuunin_unit_result.get(s, {}).get(d)
-            return (unit + sh) if unit else sh
+            return (unit + abbr) if unit else abbr
         elif kanmu_map.get(s, "×") == "○":
             unit = ab_unit_result.get(s, {}).get(d)
-            return (unit + sh) if unit else sh
+            return (unit + abbr) if unit else abbr
         else:
             unit = unit_map.get(s, "")
-            return (unit + sh) if unit in ("A", "B") else sh
+            return (unit + abbr) if unit in ("A", "B") else abbr
 
     # ── セル色決定 ──
     def cell_fill(s, d):
@@ -858,220 +1236,263 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
                 return GREEN_FILL
         if s in shuunin_list:
             unit = shuunin_unit_result.get(s, {}).get(d)
-            sh   = result[s].get(d, "×")
+            sh   = result.get(s, {}).get(d, "×")
             if sh == "早" and unit:
                 return BLUE_FILL
         return None
 
-    # ── ヘッダー行 ──
-    ws.cell(1, 1, "作成月").font = Font(bold=True)
-    ws.cell(1, 2, days_norm[0].strftime("%Y年%m月"))
-    ws.cell(2, 2, "曜日").alignment = Alignment(horizontal="center")
-    ws.cell(3, 1, "ユニット").alignment = Alignment(horizontal="center")
-    ws.cell(3, 2, "職員名").alignment  = Alignment(horizontal="center")
-    ws.cell(3, 1).fill = HEADER_FILL; ws.cell(3, 1).font = Font(bold=True, color="FFFFFF")
-    ws.cell(3, 2).fill = HEADER_FILL; ws.cell(3, 2).font = Font(bold=True, color="FFFFFF")
+    # ── 行1: 月ラベル ──
+    # Windows互換: %-m月 は Linux のみ動作するため month 属性で代替
+    month_label = f"{days_norm[0].month}月" if days_norm else ""
+    label_col = DATE_START_COL + N // 2  # 日付範囲の中央付近
+    c = ws.cell(1, label_col, month_label)
+    c.font = Font(bold=True, size=14)
+    c.alignment = Alignment(horizontal="center")
 
+    # ── 行2: 日付番号 ──
+    ws.cell(2, 1, "日").alignment = Alignment(horizontal="center")
+    ws.cell(2, 1).font = Font(bold=True)
     for i, d in enumerate(days_norm):
         col = DATE_START_COL + i
-        c1 = ws.cell(1, col, d.day)
-        c1.alignment = Alignment(horizontal="center")
-        c1.font = Font(bold=True)
-        c1.border = thin_border
-        wd_cell = ws.cell(2, col, weekday_ja[d.weekday()])
-        wd_cell.alignment = Alignment(horizontal="center")
-        wd_cell.border = thin_border
-        if d.weekday() == 5:
-            wd_cell.fill = PatternFill("solid", fgColor="CCE5FF")
-        elif d.weekday() == 6:
-            wd_cell.fill = PatternFill("solid", fgColor="FFCCCC")
-        # 日付ヘッダー行
-        hc3 = ws.cell(3, col)
-        hc3.fill = HEADER_FILL2
-        hc3.font = Font(color="FFFFFF")
-        hc3.border = header_border
-
-    for k, h in enumerate(SUMMARY_HDRS):
-        c = ws.cell(3, SUMMARY_COL + k, h)
-        c.fill = YELLOW_FILL
+        c = ws.cell(2, col, d.day)
         c.alignment = Alignment(horizontal="center")
         c.font = Font(bold=True)
-        c.border = header_border
-    # 行1,2のヘッダー部分（ユニット・職員名列）に罫線
-    for r12 in [1, 2]:
-        ws.cell(r12, 1).border = thin_border
-        ws.cell(r12, 2).border = thin_border
+        c.border = thin_border
 
-    # ── 主任行 ──
-    for idx, s in enumerate(shuunin_list):
-        row = STAFF_START_ROW + idx
-        ws.cell(row, 1, "主任").alignment = Alignment(horizontal="center")
-        ws.cell(row, 1).fill = BLUE_FILL
-        ws.cell(row, 1).font = Font(bold=True)
-        ws.cell(row, 2, s).alignment = Alignment(horizontal="center")
-        ws.cell(row, 2).fill = BLUE_FILL
+    # ── 行3: 曜日 + 集計略称 ──
+    ws.cell(3, 1, "曜日").alignment = Alignment(horizontal="center")
+    ws.cell(3, 1).font = Font(bold=True)
+    for i, d in enumerate(days_norm):
+        col = DATE_START_COL + i
+        wd  = weekday_ja[d.weekday()]
+        c   = ws.cell(3, col, wd)
+        c.alignment = Alignment(horizontal="center")
+        c.border = thin_border
+        if d.weekday() == 5:   # 土
+            c.fill = PatternFill("solid", fgColor="CCE5FF")
+        elif d.weekday() == 6: # 日
+            c.fill = PatternFill("solid", fgColor="FFCCCC")
 
-        for d in range(N):
-            col  = DATE_START_COL + d
-            val  = display_val(s, d)
-            cell = ws.cell(row, col, val)
-            cell.alignment = Alignment(horizontal="center")
-            cell.border = thin_border
-            f = cell_fill(s, d)
-            if f:
-                cell.fill = f
-
-        # ユニット・職員名セルに罫線
-        ws.cell(row, 1).border = left_border
-        ws.cell(row, 2).border = thin_border
-
-        # 個人COUNTIF集計
-        ds  = get_column_letter(DATE_START_COL)
-        de  = get_column_letter(DATE_START_COL + N - 1)
-        rng = f"{ds}{row}:{de}{row}"
-        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"A早")+COUNTIF({rng},"B早")')
-        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"A遅")+COUNTIF({rng},"B遅")')
-        ws.cell(row, SUMMARY_COL + 2, f'=COUNTIF({rng},"日")')
-        ws.cell(row, SUMMARY_COL + 3, f'=COUNTIF({rng},"夜")')
-        ws.cell(row, SUMMARY_COL + 4, f'=COUNTIF({rng},"×")+COUNTIF({rng},"○")')  # 公休: ×+○
-        ws.cell(row, SUMMARY_COL + 5, f'=COUNTIF({rng},"有")')                     # 有給
-        for k in range(len(SUMMARY_HDRS)):
-            c = ws.cell(row, SUMMARY_COL + k)
+    # 集計略称（行3）
+    for k, abbr in enumerate(SUMM_ABBR):
+        if abbr:
+            c = ws.cell(3, SUMMARY_COL + k, abbr)
             c.alignment = Alignment(horizontal="center")
-            c.border = thin_border
+            c.font = Font(bold=True)
             c.fill = YELLOW_FILL
+            c.border = thin_border
 
-    # 主任と一般職員の区切り線
-    if shuunin_list:
-        for col in range(1, SUMMARY_COL + len(SUMMARY_HDRS)):
-            ws.cell(SHUUNIN_SEP_ROW, col).fill = PatternFill("solid", fgColor="E0E0E0")
+    # ── 行4: 会議・委員会 + 集計正式名 ──
+    c4 = ws.cell(4, 1, "会議・委員会")
+    c4.alignment = Alignment(horizontal="center", vertical="center")
+    c4.font = Font(bold=True)
+    c4.border = thin_border
+    # 日付部分（行4）は空セルに細罫線のみ
+    for i in range(N):
+        ws.cell(4, DATE_START_COL + i).border = thin_border
 
-    # ── 一般職員行 ──
-    for idx, s in enumerate(sorted_staff):
-        row = SHUUNIN_SEP_ROW + idx + (1 if shuunin_list else 0)
-        u   = unit_map.get(s, "")
-        k   = kanmu_map.get(s, "×")
-        # ユニット表示
-        if k == "○":
-            u_label = f"{u}兼"
-        else:
-            u_label = u
-        uc = ws.cell(row, 1, u_label)
-        uc.alignment = Alignment(horizontal="center")
-        if u == "A":
-            uc.fill = A_UNIT_FILL
-        elif u == "B":
-            uc.fill = B_UNIT_FILL
+    # 集計正式名（行4）
+    for k, h in enumerate(SUMM_FULL):
+        c = ws.cell(4, SUMMARY_COL + k, h)
+        c.alignment = Alignment(horizontal="center")
+        c.font = Font(bold=True)
+        c.fill = YELLOW_FILL
+        c.border = header_border
 
-        nc = ws.cell(row, 2, s)
-        nc.alignment = Alignment(horizontal="center")
-        if u == "A":
+    # ── 職員行を書き込むヘルパー ──
+    def write_staff_row(row, s, extra_top=False, extra_bottom=False):
+        u = unit_map.get(s, "")
+        k = kanmu_map.get(s, "×")
+        is_shuunin = (s in shuunin_list)
+
+        # 名前列（列A）
+        nc = ws.cell(row, 1, s)
+        nc.alignment = Alignment(horizontal="center", vertical="center")
+        if is_shuunin:
+            nc.fill = BLUE_FILL
+            nc.font = Font(bold=True)
+        elif u == "A":
             nc.fill = A_UNIT_FILL
         elif u == "B":
             nc.fill = B_UNIT_FILL
 
+        # 日付セル
         for d in range(N):
             col  = DATE_START_COL + d
             val  = display_val(s, d)
             cell = ws.cell(row, col, val)
             cell.alignment = Alignment(horizontal="center")
-            cell.border = thin_border
             f = cell_fill(s, d)
             if f:
                 cell.fill = f
-
-        # ユニット・職員名セルに罫線
-        ws.cell(row, 1).border = left_border
-        ws.cell(row, 2).border = thin_border
 
         # 個人COUNTIF集計
         ds  = get_column_letter(DATE_START_COL)
         de  = get_column_letter(DATE_START_COL + N - 1)
         rng = f"{ds}{row}:{de}{row}"
-        # 早出: A早+B早（兼務でない固定スタッフはAor B早のみ）
-        ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"A早")+COUNTIF({rng},"B早")')
-        ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"A遅")+COUNTIF({rng},"B遅")')
-        ws.cell(row, SUMMARY_COL + 2, f'=COUNTIF({rng},"日")')
-        ws.cell(row, SUMMARY_COL + 3, f'=COUNTIF({rng},"夜")')
-        ws.cell(row, SUMMARY_COL + 4, f'=COUNTIF({rng},"×")+COUNTIF({rng},"○")')  # 公休: ×+○
-        ws.cell(row, SUMMARY_COL + 5, f'=COUNTIF({rng},"有")')                     # 有給
-        for k2 in range(len(SUMMARY_HDRS)):
+        hc_col = ws.cell(row, SUMMARY_COL,     f'=COUNTIF({rng},"Aハ")+COUNTIF({rng},"Bハ")')   # 早出
+        hn_col = ws.cell(row, SUMMARY_COL + 1, f'=COUNTIF({rng},"ニ")')                          # 日勤
+        ho_col = ws.cell(row, SUMMARY_COL + 2, f'=COUNTIF({rng},"Aオ")+COUNTIF({rng},"Bオ")')   # 遅出
+        hy_col = ws.cell(row, SUMMARY_COL + 3, f'=COUNTIF({rng},"夜")')                          # 夜勤
+        k_col  = SUMMARY_COL + 4
+        hk     = ws.cell(row, k_col)
+        # 計（早出+日勤+遅出+夜勤）
+        hk.value = (f'={get_column_letter(SUMMARY_COL)}{row}'
+                    f'+{get_column_letter(SUMMARY_COL+1)}{row}'
+                    f'+{get_column_letter(SUMMARY_COL+2)}{row}'
+                    f'+{get_column_letter(SUMMARY_COL+3)}{row}')
+        ws.cell(row, SUMMARY_COL + 5, f'=COUNTIF({rng},"○")')  # ○
+        ws.cell(row, SUMMARY_COL + 6, f'=COUNTIF({rng},"×")')  # ×
+        # 計（公休: ○+×）
+        ws.cell(row, SUMMARY_COL + 7,
+                f'={get_column_letter(SUMMARY_COL+5)}{row}'
+                f'+{get_column_letter(SUMMARY_COL+6)}{row}')
+        ws.cell(row, SUMMARY_COL + 8, f'=COUNTIF({rng},"年")')  # 年休
+        # 合計（計+計+年休）
+        ws.cell(row, SUMMARY_COL + 9,
+                f'={get_column_letter(SUMMARY_COL+4)}{row}'
+                f'+{get_column_letter(SUMMARY_COL+7)}{row}'
+                f'+{get_column_letter(SUMMARY_COL+8)}{row}')
+        for k2 in range(NUM_SUMM):
             c = ws.cell(row, SUMMARY_COL + k2)
             c.alignment = Alignment(horizontal="center")
-            c.border = thin_border
             c.fill = YELLOW_FILL
 
-    # ── 日別集計行（COUNTIF数式）──
-    # COUNTIFレンジ: 全スタッフ行（STAFF_START_ROW ～ LAST_STAFF_ROW）
-    daily_labels = ["A早出","B早出","A遅出","B遅出","夜勤"]
-    daily_values = ["A早",  "B早",  "A遅",  "B遅",  "夜" ]
-    daily_fills  = [A_UNIT_FILL, B_UNIT_FILL, A_UNIT_FILL, B_UNIT_FILL, GRAY_FILL]
+        # ── 罫線を行全体に適用 ──
+        # top/bottom の調整
+        top_side    = medium if extra_top    else thin
+        bottom_side = medium if extra_bottom else thin
 
-    for k, (lbl, fill) in enumerate(zip(daily_labels, daily_fills)):
-        r = SUMMARY_ROW_BASE + k
-        c = ws.cell(r, 2, lbl)
+        # 名前列(A列)
+        ws.cell(row, 1).border = Border(
+            left=medium, right=thin, top=top_side, bottom=bottom_side)
+        # 日付列
+        for d in range(N):
+            col = DATE_START_COL + d
+            ws.cell(row, col).border = Border(
+                left=thin, right=thin, top=top_side, bottom=bottom_side)
+        # 集計列
+        for k2 in range(NUM_SUMM):
+            ws.cell(row, SUMMARY_COL + k2).border = Border(
+                left=thin, right=thin, top=top_side, bottom=bottom_side)
+
+    # ── グループ1（非B: 主任+Aユニット）を書き込む ──
+    for idx, s in enumerate(group1):
+        row = STAFF_START_ROW + idx
+        is_last  = (idx == len(group1) - 1) and len(group2) > 0
+        write_staff_row(row, s, extra_bottom=is_last)
+
+    # ── グループ2（Bユニット）を書き込む ──
+    for idx, s in enumerate(group2):
+        row = first_group2_row + idx
+        is_first = (idx == 0)
+        write_staff_row(row, s, extra_top=is_first)
+
+    # ── Settings!B5 の日付列に太い罫線 ──
+    if period_end_col_offset is not None:
+        period_end_col = DATE_START_COL + period_end_col_offset  # 該当日付列
+        next_col       = period_end_col + 1
+        # 全行（ヘッダー+職員+集計行）に適用
+        apply_rows = list(range(2, LAST_STAFF_ROW + 1)) + list(range(DAILY_ROW_BASE, DAILY_ROW_BASE + 6))
+        for row in apply_rows:
+            # 期間終了日列: right=medium
+            c = ws.cell(row, period_end_col)
+            old_b = c.border
+            c.border = Border(
+                left  = old_b.left  if old_b.left  else thin,
+                right = medium,
+                top   = old_b.top   if old_b.top   else thin,
+                bottom= old_b.bottom if old_b.bottom else thin)
+            # 次の列: left=medium
+            if next_col <= SUMMARY_COL - 1:  # 集計列の手前まで
+                c2 = ws.cell(row, next_col)
+                old_b2 = c2.border
+                c2.border = Border(
+                    left  = medium,
+                    right = old_b2.right  if old_b2.right  else thin,
+                    top   = old_b2.top    if old_b2.top    else thin,
+                    bottom= old_b2.bottom if old_b2.bottom else thin)
+
+    # ── 日別集計行（COUNTIF数式）──
+    daily_labels = ["A早出", "B早出", "A遅出", "B遅出", "夜勤", "日勤"]
+    daily_codes  = ["Aハ",   "Bハ",   "Aオ",  "Bオ",  "夜",  "ニ"]
+    daily_fills  = [A_UNIT_FILL, B_UNIT_FILL, A_UNIT_FILL, B_UNIT_FILL, GRAY_FILL, GRAY_FILL]
+
+    cnt_start_row = STAFF_START_ROW
+    cnt_end_row   = LAST_STAFF_ROW
+
+    for k, (lbl, dv, fill) in enumerate(zip(daily_labels, daily_codes, daily_fills)):
+        dr = DAILY_ROW_BASE + k
+        c = ws.cell(dr, 1, lbl)
         c.fill = fill
         c.alignment = Alignment(horizontal="center")
         c.font = Font(bold=True)
+        c.border = Border(left=medium, right=thin, top=thin, bottom=thin)
 
-    for i in range(N):
-        col = DATE_START_COL + i
-        col_letter = get_column_letter(col)
-        # スタッフ全行のレンジ（区切り行を含むが空白なのでCOUNTIFに影響なし）
-        cnt_range = f"{col_letter}{STAFF_START_ROW}:{col_letter}{LAST_STAFF_ROW}"
-        for k, (_, dv) in enumerate(zip(daily_labels, daily_values)):
-            r = SUMMARY_ROW_BASE + k
-            c = ws.cell(r, col, f'=COUNTIF({cnt_range},"{dv}")')
-            c.alignment = Alignment(horizontal="center")
-            c.border = thin_border
-    # 集計行のラベル列に罫線
+        for i in range(N):
+            col = DATE_START_COL + i
+            col_letter = get_column_letter(col)
+            cnt_range = f"{col_letter}{cnt_start_row}:{col_letter}{cnt_end_row}"
+            formula_val = f'=COUNTIF({cnt_range},"{dv}")'
+            dc = ws.cell(dr, col, formula_val)
+            dc.alignment = Alignment(horizontal="center")
+            dc.border = thin_border
+
+        # 集計列は空白（行ラベルのみ）
+        for k2 in range(NUM_SUMM):
+            ws.cell(dr, SUMMARY_COL + k2).border = thin_border
+
+    # ── 条件付き書式: 日別集計行の値が0の場合は赤字 ──
+    red_font_rule = CellIsRule(
+        operator="equal",
+        formula=["0"],
+        font=Font(color="FF0000", bold=True))
+    first_date_letter = get_column_letter(DATE_START_COL)
+    last_date_letter  = get_column_letter(DATE_START_COL + N - 1)
     for k in range(len(daily_labels)):
-        r = SUMMARY_ROW_BASE + k
-        ws.cell(r, 1).border = left_border
-        ws.cell(r, 2).border = thin_border
+        dr = DAILY_ROW_BASE + k
+        range_str = f"{first_date_letter}{dr}:{last_date_letter}{dr}"
+        ws.conditional_formatting.add(range_str, red_font_rule)
 
-    # ── 罫線を全セルに適用 ──
-    max_row = SUMMARY_ROW_BASE + len(daily_labels) - 1
-    max_col = SUMMARY_COL + len(SUMMARY_HDRS) - 1
-    for r in range(1, max_row + 1):
-        for c in range(1, max_col + 1):
-            cell = ws.cell(r, c)
-            if cell.value is not None or r <= max_row:
-                if r == 3:  # ヘッダー行（日付行）は太め
-                    cell.border = header_border
-                elif c == 1:  # ユニット列は左太め
-                    cell.border = left_border
-                else:
-                    cell.border = thin_border
+    # ── 空白行（職員行〜日別集計行の間）の罫線 ──
+    sep_row = LAST_STAFF_ROW + 1
+    for col in range(1, SUMMARY_COL + NUM_SUMM):
+        ws.cell(sep_row, col).border = thin_border
 
-    # ── 列幅 ──
-    ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 10
+    # ── 行1のヘッダー列に罫線 ──
+    ws.cell(1, 1).border = Border(left=medium, right=thin, top=thin, bottom=thin)
+    for i in range(N):
+        ws.cell(1, DATE_START_COL + i).border = thin_border
+
+    # ── 行2・行3のA列に罫線 ──
+    for r in [2, 3, 4]:
+        ws.cell(r, 1).border = Border(left=medium, right=thin, top=thin, bottom=thin)
+
+    # ── 列幅・行高さ ──
+    ws.column_dimensions["A"].width = 10
     for i in range(N):
         ws.column_dimensions[get_column_letter(DATE_START_COL + i)].width = 5
-    for k in range(len(SUMMARY_HDRS)):
-        ws.column_dimensions[get_column_letter(SUMMARY_COL + k)].width = 8
+    for k in range(NUM_SUMM):
+        ws.column_dimensions[get_column_letter(SUMMARY_COL + k)].width = 7
 
-    # ── 行高さ設定 ──
-    ws.row_dimensions[1].height = 18
-    ws.row_dimensions[2].height = 18
-    ws.row_dimensions[3].height = 18
-    for r in range(STAFF_START_ROW, max_row + 1):
+    for r in range(1, 5):
+        ws.row_dimensions[r].height = 18
+    for r in range(STAFF_START_ROW, LAST_STAFF_ROW + 1):
         ws.row_dimensions[r].height = 16
+    for k in range(len(daily_labels)):
+        ws.row_dimensions[DAILY_ROW_BASE + k].height = 16
 
-    # ── 印刷設定（A4横向き、1ページ幅に収める）──
+    # ── 印刷設定（A4横向き）──
     from openpyxl.worksheet.properties import WorksheetProperties, PageSetupProperties
     ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
     ws.page_setup.orientation = "landscape"
-    ws.page_setup.paperSize = 9   # A4
-    ws.page_setup.fitToPage = True
-    ws.page_setup.fitToWidth = 1
+    ws.page_setup.paperSize   = 9   # A4
+    ws.page_setup.fitToPage   = True
+    ws.page_setup.fitToWidth  = 1
     ws.page_setup.fitToHeight = 0
-    from openpyxl.worksheet.page import PageMargins
-    ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.7,
-                                   bottom=0.7, header=0.3, footer=0.3)
-    # タイトル行を繰り返す（印刷時に各ページに行1-3を表示）
-    ws.print_title_rows = "1:3"
+    ws.page_margins = PageMargins(
+        left=0.4, right=0.4, top=0.7, bottom=0.7, header=0.3, footer=0.3)
+    ws.print_title_rows = "1:4"
 
     wb.save(output_path)
 
@@ -1313,7 +1734,7 @@ HTML_CONTENT = """
                 <i data-lucide="cpu" color="#fff" size="24"></i>
             </div>
             <div>
-                <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools</span></div>
+                <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools v5.8</span></div>
                 <div class="brand-subtitle">The Intelligent Auto-Roster Engine</div>
             </div>
         </div>
@@ -1500,9 +1921,24 @@ HTML_CONTENT = """
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement("a");
                 a.href = url; a.download = "SS_Result.xlsx"; a.click();
-            } else { throw new Error(); }
+            } else {
+                // サーバーエラーの詳細を取得してログに表示
+                let errDetail = "（詳細不明）";
+                try {
+                    const errJson = await res.json();
+                    if (errJson && errJson.detail) errDetail = errJson.detail;
+                } catch(_) {}
+                // 改行ごとに分けて赤字で表示
+                const errLines = errDetail.split("\n");
+                addLog("═══ サーバーエラー発生 ═══", "#ff4d4d");
+                errLines.forEach(line => {
+                    if (line.trim()) addLog(line, "#ff6b6b");
+                });
+                addLog("─── エラー終了 ─── データまたは制約条件を見直してください。", "#ff4d4d");
+            }
         } catch (e) {
-            addLog("致命的エラー: 制約条件が矛盾しているか、データが不正です。", "#ff4d4d");
+            addLog("ネットワークエラー: サーバーへの接続に失敗しました。", "#ff4d4d");
+            addLog(String(e), "#ff6b6b");
         } finally {
             // タイマー停止
             clearInterval(timerInterval);
@@ -1545,7 +1981,7 @@ async def favicon_ico():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "5.2"}
+    return {"status": "ok", "version": "5.7"}
 
 @app.post("/generate-shift")
 async def generate(file: UploadFile = File(...)):
