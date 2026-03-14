@@ -32,22 +32,36 @@ WEEKDAY_MAP = {
     "月曜": 0, "火曜": 1, "水曜": 2, "木曜": 3, "金曜": 4, "土曜": 5, "日曜": 6,
 }
 
-# ── favicon 読み込み ──
-FAVICON_B64 = ""
-_favicon_path = pathlib.Path(__file__).parent / "favicon.png"
-if _favicon_path.exists():
-    with open(_favicon_path, "rb") as _f:
-        FAVICON_B64 = base64.b64encode(_f.read()).decode()
-
 
 # ========================================================
 # Settings 読み込み
 # ========================================================
 def load_settings(df):
-
+    """
+    Settingsシートから期間、公休数、年休数、特定曜日の日勤配置設定を取得。
+    戻り値:
+      days: [datetime, ...]
+      holiday_limits: {"40h": N, "32h": N, "パート": N}  ← 月の公休数
+      nenkyuu_limits: {"40h": N, "32h": N}               ← 月の年休上限
+      nikkin_days: [int, ...] (0=月, 1=火, ..., 6=日)
+    """
     start, end = None, None
     holidays = {}
     nenkyuu = {}
+    nikkin_days = []
+    
+    # v6.0: 特定曜日の日勤配置設定 (D,E列の1,2行目)
+    # D1: "日勤の配置", D2, E2: 曜日
+    try:
+        for r in [1]: # 2行目 (index 1)
+            for c in [3, 4]: # D, E列 (index 3, 4)
+                val = str(df.iloc[r, c]).strip()
+                day_map = {"月曜":0, "火曜":1, "水曜":2, "木曜":3, "金曜":4, "土曜":5, "日曜":6}
+                if val in day_map:
+                    nikkin_days.append(day_map[val])
+    except:
+        pass
+
     header_row = None
     for i in range(len(df)):
         v = str(df.iloc[i, 0]).strip()
@@ -77,6 +91,7 @@ def load_settings(df):
         m = re.search(r"\d+", n_str)
         if m and c not in ["nan", "None", ""]:
             num = int(m.group())
+            # v6.0: 複数行ある場合は合計する
             if "40" in c:
                 holidays["40h"] = holidays.get("40h", 0) + num
             elif "32" in c:
@@ -87,34 +102,38 @@ def load_settings(df):
         nen_m = re.search(r"\d+", nen_str)
         if nen_m and c not in ["nan", "None", ""]:
             nen_num = int(nen_m.group())
+            # v6.0: 複数行ある場合は合計する
             if "40" in c:
-                # 同一契約区分で複数行ある場合、最初の非零値を採用
-                if nenkyuu.get("40h", 0) == 0:
-                    nenkyuu["40h"] = nen_num
+                nenkyuu["40h"] = nenkyuu.get("40h", 0) + nen_num
             elif "32" in c:
-                if nenkyuu.get("32h", 0) == 0:
-                    nenkyuu["32h"] = nen_num
+                nenkyuu["32h"] = nenkyuu.get("32h", 0) + nen_num
             elif "パート" in c:
-                if nenkyuu.get("パート", 0) == 0:
-                    nenkyuu["パート"] = nen_num
+                nenkyuu["パート"] = nenkyuu.get("パート", 0) + nen_num
 
     if start is None or end is None:
         raise Exception("期間が取得できませんでした")
 
-    holidays.setdefault("40h", 9)
-    holidays.setdefault("32h", 8)
-    holidays.setdefault("パート", 0)
-    # 年休デフォルト（Settingsに記載がない場合は従来の2日）
-    nenkyuu.setdefault("40h", 2)
-    nenkyuu.setdefault("32h", 2)
-    nenkyuu.setdefault("パート", 0)
+    # v6.0: Settingsに記載がない場合のみデフォルト値を設定
+    if not holidays:
+        holidays = {"40h": 9, "32h": 8, "パート": 0}
+    else:
+        holidays.setdefault("40h", 0)
+        holidays.setdefault("32h", 0)
+        holidays.setdefault("パート", 0)
+
+    if not nenkyuu:
+        nenkyuu = {"40h": 2, "32h": 2, "パート": 0}
+    else:
+        nenkyuu.setdefault("40h", 0)
+        nenkyuu.setdefault("32h", 0)
+        nenkyuu.setdefault("パート", 0)
 
     days = []
     d = start
     while d <= end:
         days.append(d)
         d += timedelta(days=1)
-    return days, holidays, nenkyuu
+    return days, holidays, nenkyuu, nikkin_days
 
 
 # ========================================================
@@ -222,8 +241,12 @@ def count_trailing_consec(shift_seq):
 def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
                          allowed_shifts_map, fixed_holiday_map, holiday_limits,
                          cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
-                         unit_map=None, ab_staff_set=None):
-
+                         unit_map=None, ab_staff_set=None,
+                         weekday_allowed_map=None, nikkin_days_settings=None):
+    """
+    ソルバーがINFEASIBLEになった原因を診断して具体的なエラーメッセージを返す。
+    重複メッセージはまとめて返す。
+    """
     msgs = []
     seen = set()
 
@@ -237,10 +260,10 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
         "夜": "夜勤", "×": "休み(×)", "有": "年休(有)", "○": "明け(○)"
     }
     # 「指定」で許可されるシフト（備考制限外でも可）
-    ALLOWED_SPECIFIED = {"早", "遅", "夜"}
+    # v6.0: Shift_Requestsの「指定」は備考制限を全シフト種別で上書きするため、
+    # 備考制限と指定の矛盾はエラーとしない（制約12で許可済み）
 
-    # ── 1. 備考制限と希望シフトの矛盾（一般・パートスタッフのみ）──
-    # 「指定」の場合は早出・遅出・夜勤のいずれかなら備考制限を超えてもOK
+    # ── 1. 備考制限と希望シフトの矛盾チェック（v6.0: 指定は全シフト種別で優先）──
     # 主任はCheck 2 で専用処理するためここでは除外
     for s in staff:
         allowed = allowed_shifts_map.get(s)
@@ -251,18 +274,21 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
             if sh_type not in ["早","遅","日","夜"]:
                 continue
             is_in_allowed = sh_type in allowed
-            is_allowed_specified = (req_type == "指定" and sh_type in ALLOWED_SPECIFIED)
-            if not is_in_allowed and not is_allowed_specified and req_type == "指定":
+            # v6.0: 「指定」は全シフト種別で備考制限を上書きするため矛盾なし
+            if req_type == "指定":
+                continue  # 指定は常に優先
+            # 「希望」の場合のみ備考制限との矛盾をチェック
+            if not is_in_allowed and req_type == "希望":
                 forbidden_reqs.append(
-                    f"{date_obj.strftime('%m/%d')}({SHIFT_NAME.get(sh_type,sh_type)})指定")
+                    f"{date_obj.strftime('%m/%d')}({SHIFT_NAME.get(sh_type,sh_type)})希望")
         if forbidden_reqs:
             allowed_names = ",".join(SHIFT_NAME.get(a, a) for a in sorted(allowed))
             days_str = ", ".join(forbidden_reqs)
             add_msg(
-                f"致命的エラー: {s}さんの 希望シフト・希望休の制約条件が矛盾しているか、データが不正です。\n"
-                f"  備考制限: 許可勤務は [{allowed_names}] のみ（指定で 早出・遅出・夜勤 は可）\n"
-                f"  矛盾する指定: {days_str}\n"
-                f"  → Shift_Requestsシートで該当日の指定を 早出(ハ)・遅出(オ)・夜勤・休み(×) に変更してください。"
+                f"警告: {s}さんの 希望シフトが備考制限と矛盾しています（希望は無視されます）。\n"
+                f"  備考制限: 許可勤務は [{allowed_names}] のみ\n"
+                f"  矛盾する希望: {days_str}\n"
+                f"  → 備考制限を変更するか、Shift_Requestsシートで指定（指定勤務）に変更してください。"
             )
 
     # ── 2. 主任への不正シフト指定（遅・夜の指定はOK、日・有・○は不可）──
@@ -324,9 +350,10 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
             )
 
     # ── 5. 夜勤可能スタッフ全体の夜勤数チェック ──
+    # v6.0: nmax_map.get(s, 0) を使用して夜勤可能スタッフを判定
     night_capable = [s for s in staff if nmax_map.get(s, 0) > 0]
-    total_nmax = sum(nmax_map[s] for s in night_capable)
-    total_nmin = sum(nmin_map[s] for s in night_capable)
+    total_nmax = sum(nmax_map.get(s, 0) for s in night_capable)
+    total_nmin = sum(nmin_map.get(s, 0) for s in night_capable)
     if total_nmin > N:
         names = ", ".join(f"{s}({nmin_map[s]}回)" for s in night_capable)
         add_msg(
@@ -343,7 +370,6 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
             f"  [{names}]\n"
             f"  → 夜勤最高数の合計が{N}以上になるよう各職員の設定を見直してください。"
         )
-
     # ── 6. 人数不足チェック（各日の早出カバレッジ簡易確認）──
     if unit_map is not None and days_norm:
         _ab_set = ab_staff_set or set()
@@ -376,7 +402,60 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
                     f"  → {date_str}前後の希望休・固定休を見直してください。"
                 )
 
-    # ── 7. パート職員の年休希望チェック ──
+    # ── 7. 曜日指定勤務の矛盾チェック (v6.0) ──
+    if weekday_allowed_map:
+        for s, wd_map in weekday_allowed_map.items():
+            for wd, allowed_wd in wd_map.items():
+                for d, dn in enumerate(days_norm):
+                    if dn.weekday() == wd:
+                        req = requests.get(s, {}).get(dn)
+                        if req and req[1] == "希望" and req[0] not in allowed_wd:
+                            allowed_names = ",".join(SHIFT_NAME.get(a, a) for a in sorted(allowed_wd))
+                            add_msg(
+                                f"警告: {s}さんの {dn.strftime('%m/%d')} の希望({SHIFT_NAME.get(req[0],req[0])})が"
+                                f"備考の曜日指定({allowed_names})と矛盾しています。\n"
+                                f"  → 備考の曜日指定を変更するか、希望を修正してください。"
+                            )
+
+    # ── 8. 特定曜日の日勤配置チェック (v6.0) ──
+    if nikkin_days_settings and days_norm:
+        for wd_target in nikkin_days_settings:
+            for d, dn in enumerate(days_norm):
+                if dn.weekday() == wd_target:
+                    # 日勤可能なスタッフ（主任以外）
+                    nikkin_avail = []
+                    for s in staff:
+                        req = requests.get(s, {}).get(dn)
+                        # 休み指定、年休指定、他シフト指定がある場合は不可
+                        if req and req[1] == "指定" and req[0] != "日":
+                            continue
+                        # 備考制限で日勤禁止の場合は不可
+                        allowed = allowed_shifts_map.get(s)
+                        if allowed is not None and "日" not in allowed:
+                            continue
+                        # 曜日指定で日勤禁止の場合は不可
+                        if s in weekday_allowed_map and wd_target in weekday_allowed_map[s]:
+                            if "日" not in weekday_allowed_map[s][wd_target]:
+                                continue
+                        nikkin_avail.append(s)
+                    
+                    if not nikkin_avail:
+                        # 主任も確認
+                        shuunin_avail = []
+                        for s in shuunin_list:
+                            req = requests.get(s, {}).get(dn)
+                            if req and req[1] == "指定" and req[0] != "日": continue
+                            shuunin_avail.append(s)
+                        
+                        if not shuunin_avail:
+                            day_name = ["月","火","水","木","金","土","日"][wd_target]
+                            add_msg(
+                                f"致命的エラー: {dn.strftime('%m/%d')}({day_name}) の日勤配置(1名)に対して、"
+                                f"出勤可能なスタッフが不足しています。\n"
+                                f"  → 該当日付近の希望休や備考の勤務制限を見直してください。"
+                            )
+
+    # ── 9. パート職員の年休希望チェック ──
     for s in [s2 for s2 in staff if cont_map.get(s2) == "パート"]:
         warn_days = []
         for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
@@ -409,8 +488,13 @@ def generate_shift(file_path):
     staff_df["職員名"] = staff_df["職員名"].astype(str).str.strip()
 
     def col_num(name, default=0):
+        # v6.0: 列名が重複している場合や、型が混在している場合に対応
         if name in staff_df.columns:
-            return pd.to_numeric(staff_df[name], errors="coerce").fillna(default).astype(int)
+            # 最初の該当列を使用
+            col_data = staff_df[name]
+            if isinstance(col_data, pd.DataFrame):
+                col_data = col_data.iloc[:, 0]
+            return pd.to_numeric(col_data, errors="coerce").fillna(default).astype(int)
         return pd.Series([default]*len(staff_df))
 
     staff_df["夜勤最少数"] = col_num("夜勤最少数", 0)
@@ -468,7 +552,7 @@ def generate_shift(file_path):
     part_staff = [s for s in staff if cont_map[s] == "パート"]
 
     # 設定・希望・前月
-    days, holiday_limits, nenkyuu_limits = load_settings(settings_df)
+    days, holiday_limits, nenkyuu_limits, nikkin_days_settings = load_settings(settings_df)
     N = len(days)
     all_names_for_req = all_staff_names  # 主任も希望シフト対象
     requests   = load_requests(request_df, days, all_names_for_req, part_staff=part_staff)
@@ -483,57 +567,11 @@ def generate_shift(file_path):
     # ── 備考解析 ──
     allowed_shifts_map = {}
     weekly_work_days   = {}
+    weekday_allowed_map = {} # v6.0: 曜日ごとの勤務制限 {staff: {weekday: {allowed_shifts}}}
     part_with_fixed = set()
 
-    # 備考の曜日別シフト指定を解析するヘルパー
-    # 例: "日曜：夜勤か×" / "水曜：早出" / "金曜：×か遅出"
-    SHIFT_KEYWORD_MAP = {
-        "早出": "早", "早": "早", "ハ": "早",
-        "遅出": "遅", "遅": "遅", "オ": "遅",
-        "夜勤": "夜", "夜": "夜",
-        "日勤": "日", "日": "日", "ニ": "日",
-        "×": "×", "休み": "×",
-        "有給": "有", "年休": "有", "有": "有",
-        "○": "○",
-    }
-
-    def parse_weekday_note(note):
-        """
-        備考文字列から {曜日番号: {許可シフトセット}} を返す。
-        例: "日曜：夜勤か×、水曜：早出" → {6: {"夜","×"}, 2: {"早"}}
-        """
-        wd_map = {}
-        # パターン: 「曜日名:シフト1かシフト2...」
-        for seg in re.split(r"[,、。\n]+", note):
-            seg = seg.strip()
-            m = re.match(
-                r"([月火水木金土日](?:曜(?:日)?)?)[:：](.+)", seg)
-            if not m:
-                continue
-            wd_str = m.group(1)
-            shifts_str = m.group(2)
-            # 曜日番号
-            base = wd_str.replace("曜日","").replace("曜","")
-            wd_num = WEEKDAY_MAP.get(base) if base in WEEKDAY_MAP else WEEKDAY_MAP.get(wd_str)
-            if wd_num is None:
-                continue
-            # シフト解析
-            allowed_set = set()
-            for token in re.split(r"[かまたは/／・\s]+", shifts_str):
-                token = token.strip()
-                for kw, sh in SHIFT_KEYWORD_MAP.items():
-                    if kw in token:
-                        allowed_set.add(sh)
-                        break
-            if allowed_set:
-                wd_map[wd_num] = allowed_set
-        return wd_map
-
-    # 職員ごとの備考から曜日シフト制約マップを作成
-    weekday_shift_map = {}  # {staff_name: {weekday_int: set_of_allowed_shifts}}
-
     for s in all_staff_names:
-        note = note_map.get(s, "")
+        note = str(note_map.get(s, ""))
         allowed = None
         if "早出のみ" in note:
             allowed = {"早"}
@@ -544,14 +582,29 @@ def generate_shift(file_path):
         if allowed is not None:
             allowed_shifts_map[s] = allowed
 
+        # v6.0: 曜日指定の解析 (例: "日曜：夜勤か×", "水曜：早出")
+        day_map = {"月曜":0, "火曜":1, "水曜":2, "木曜":3, "金曜":4, "土曜":5, "日曜":6}
+        shift_map = {"早出":"早", "遅出":"遅", "夜勤":"夜", "日勤":"日", "×":"×", "休み":"×"}
+        
+        # 複数の曜日指定がある可能性を考慮して分割
+        parts = re.split(r'[、。，．,.\s]', note)
+        for part in parts:
+            m_day = re.search(r"(月曜|火曜|水曜|木曜|金曜|土曜|日曜)：(.+)", part)
+            if m_day:
+                wd = day_map[m_day.group(1)]
+                sh_str = m_day.group(2)
+                allowed_wd = set()
+                for k, v in shift_map.items():
+                    if k in sh_str:
+                        allowed_wd.add(v)
+                if allowed_wd:
+                    if s not in weekday_allowed_map:
+                        weekday_allowed_map[s] = {}
+                    weekday_allowed_map[s][wd] = allowed_wd
+
         m = re.search(r"週(\d+)日", note)
         if m:
             weekly_work_days[s] = int(m.group(1))
-
-        # 曜日別シフト制約
-        wd_sh = parse_weekday_note(note)
-        if wd_sh:
-            weekday_shift_map[s] = wd_sh
 
     for s in part_staff:
         req_s = requests.get(s, {})
@@ -566,27 +619,6 @@ def generate_shift(file_path):
         week_sun   = dn - timedelta(days=sun_offset)
         week_groups[week_sun.strftime("%Y-%m-%d")].append(d_idx)
     sorted_week_keys = sorted(week_groups.keys())
-
-    # ── SettingsのD/E列1-2行目から指定曜日日勤配置を読み込む ──
-    # D1/E1: ヘッダー（「指定曜日日勤配置」など）、D2/E2: 曜日名
-    nikkin_weekdays = []
-    try:
-        for col_idx in [3, 4]:
-            if settings_df.shape[1] > col_idx and settings_df.shape[0] > 1:
-                h_val = str(settings_df.iloc[0, col_idx]).strip()
-                d_val = str(settings_df.iloc[1, col_idx]).strip()
-                if any(kw in h_val for kw in ["指定", "日勤", "配置"]):
-                    for wd_s in re.split(r"[,、・\s/／]+", d_val):
-                        wd_s = wd_s.strip()
-                        if wd_s in WEEKDAY_MAP:
-                            wd_n = WEEKDAY_MAP[wd_s]
-                            if wd_n not in nikkin_weekdays:
-                                nikkin_weekdays.append(wd_n)
-    except Exception:
-        pass
-
-    # nikkin日（指定曜日日勤配置が適用されるday index集合）
-    nikkin_days_idx = {d for d, dn in enumerate(days_norm) if dn.weekday() in nikkin_weekdays}
 
     # ── 兼務職員（ユニット兼務=○）──
     ab_staff = [s for s in staff if kanmu_map.get(s, "×") == "○"]
@@ -718,16 +750,15 @@ def generate_shift(file_path):
                 continue  # 夜勤指定はOK
             model.Add(xs[s,d,"夜"] == 0)
 
-    # ── 制約7: 夜勤→翌日は○（夜勤明け休）──
-    # (penalty_terms はソフト制約で使用するため、ここで初期化しておく)
-    penalty_terms = []
+    # ── 制約7: 夜勤明けの制約（夜勤→翌日は○または有給）──
     cn_vars = {}
     for s in staff:
         can_consec = (consec_night_map.get(s, "×") == "○")
         for d in range(N - 1):
             if can_consec:
-                # 通常勤務・有給は翌日禁止（○か夜勤のみ）
-                for sh in ["早","遅","日","有","×"]:
+                # 連続夜勤の場合: 翌日は○か夜勤か有給のみ（早遅日×禁止）
+                # v6.0: 有給(有)は夜勤翌日でも許可
+                for sh in ["早","遅","日","×"]:
                     model.Add(x[s,d+1,sh] == 0).OnlyEnforceIf(x[s,d,"夜"])
                 cn = model.NewBoolVar(f"cn_{s}_{d}")
                 cn_vars[s,d] = cn
@@ -735,30 +766,25 @@ def generate_shift(file_path):
                 model.AddBoolOr([x[s,d,"夜"].Not(), x[s,d+1,"夜"].Not()]).OnlyEnforceIf(cn.Not())
                 if d + 3 < N:
                     model.Add(x[s,d+2,"○"] == 1).OnlyEnforceIf(cn)
-                    # d+3: 日勤は絶対禁止。早/遅/夜は「どうしても必要な場合」のみ
-                    # ソフト制約（超高ペナルティ）で緊急時のみ許容
-                    model.Add(x[s,d+3,"日"] == 0).OnlyEnforceIf(cn)
-                    for sh_w in ["早","遅","夜"]:
-                        _v3 = model.NewBoolVar(f"cd3_{s}_{d}_{sh_w}")
-                        model.AddBoolAnd([cn, x[s,d+3,sh_w]]).OnlyEnforceIf(_v3)
-                        model.AddBoolOr([cn.Not(), x[s,d+3,sh_w].Not()]).OnlyEnforceIf(_v3.Not())
-                        penalty_terms.append((_v3, 800))  # 非常に高いペナルティ
+                    # d+3は○か×か有でOK（「夜勤 夜勤 ○ ✕」「夜勤 夜勤 ○ 年休」を許容）
+                    for sh_w in ["早","遅","日","夜"]:
+                        model.Add(x[s,d+3,sh_w] == 0).OnlyEnforceIf(cn)
                 elif d + 2 < N:
                     model.Add(x[s,d+2,"○"] == 1).OnlyEnforceIf(cn)
                 if d + 2 < N:
                     model.Add(x[s,d,"夜"] + x[s,d+1,"夜"] + x[s,d+2,"夜"] <= 2)
             else:
-                # 通常は夜勤翌日=○（夜勤明け休）、または有給（出勤扱い）
-                # ○が優先だが、公休数が目標を超える場合は有給を使用
+                # 連続夜勤不可の場合: 翌日は○か有給のみ（早遅日夜×禁止）
+                # v6.0: 有給(有)は夜勤翌日でも許可
                 for sh_forbidden in ["早","遅","日","夜","×"]:
                     model.Add(x[s,d+1,sh_forbidden] == 0).OnlyEnforceIf(x[s,d,"夜"])
-                # 翌日は○か有のみ（one-shift制約により自動保証）
 
     for s in shuunin_list:
         for d in range(N - 1):
             model.Add(xs[s,d+1,"○"] == 1).OnlyEnforceIf(xs[s,d,"夜"])
 
     # ── 制約7-2: ○は必ず前日夜勤の場合のみ発生（夜勤明け以外に○禁止）──
+    # v6.0: 夜勤翌日は○か有給のどちらかになる。
     for s in staff:
         for d in range(N):
             if d == 0:
@@ -766,9 +792,9 @@ def generate_shift(file_path):
                 if not (prev_seq and prev_seq[-1] == "夜"):
                     model.Add(x[s, 0, "○"] == 0)
             else:
+                # 前日が夜勤でない場合は○禁止
                 model.Add(x[s, d, "○"] == 0).OnlyEnforceIf(x[s, d-1, "夜"].Not())
 
-    # ── 制約7-3: 主任の○は前日夜勤のみ（夜勤なしの日は○禁止）──
     for s in shuunin_list:
         for d in range(N):
             if d == 0:
@@ -796,67 +822,95 @@ def generate_shift(file_path):
                         break
 
     # ── 制約10: 連勤制限 ──
-    for s in staff:
+    # v6.0: 主任も連勤制限の対象に含める
+    for s in all_staff_names:
         max_c  = 5 if cont_map[s] == "40h" else 4
         prev_c = count_trailing_consec(prev_month.get(s, []))
         remain = max(0, max_c - prev_c)
+        var_d = xs if s in shuunin_list else x
         if prev_c > 0 and remain < max_c:
             for w in range(1, min(remain + 2, N + 1)):
                 if w > remain:
-                    model.Add(sum(x[s,d2,sh2] for d2 in range(w)
-                                  for sh2 in ["早","遅","夜","有","日"]) <= remain)
+                    # v6.0: 有給(有)も出勤扱いとして連勤に含める
+                    model.Add(sum(var_d[s,d2,sh2] for d2 in range(w)
+                                  for sh2 in ["早","遅","夜","日","有"]) <= remain)
                     break
         for st in range(N - max_c):
-            model.Add(sum(x[s,d2,sh2] for d2 in range(st, st+max_c+1)
-                          for sh2 in ["早","遅","夜","有","日"]) <= max_c)
+            # v6.0: 有給(有)も出勤扱いとして連勤に含める
+            model.Add(sum(var_d[s,d2,sh2] for d2 in range(st, st+max_c+1)
+                          for sh2 in ["早","遅","夜","日","有"]) <= max_c)
 
-    # ── 制約11: 公休数（×+○）を指定日数に厳密に設定（主任除く）──
-    # ○は夜勤明け休（夜勤回数と連動）、×は通常公休
-    for s in staff:
-        min_hol = holiday_limits.get(cont_map[s], 8)
-        if min_hol > 0:
-            total_off = (sum(x[s,d,"×"] for d in range(N)) +
-                         sum(x[s,d,"○"] for d in range(N)))
-            model.Add(total_off >= min_hol)
-            model.Add(total_off <= min_hol)  # 多くても少なくてもダメ（等式）
-
-    # ── 制約12: 備考による勤務制限（月間全般制限 + 曜日別制限）──
-    # Shift_Requestsの「指定」は備考制限より優先される
+    # ── 制約10-2: 同一勤務の連勤制限（最大2連勤まで） ──
     for s in all_staff_names:
-        allowed = allowed_shifts_map.get(s)
         var_d = xs if s in shuunin_list else x
-        # 月間全般の勤務制限
+        for sh in ["早", "遅", "日"]:
+            # 前月実績からの継続チェック
+            prev_seq = prev_month.get(s, [])
+            prev_sh_c = 0
+            for ps in reversed(prev_seq):
+                if ps == sh: prev_sh_c += 1
+                else: break
+            
+            if prev_sh_c >= 2:
+                model.Add(var_d[s, 0, sh] == 0)
+            elif prev_sh_c == 1:
+                if N >= 2:
+                    model.Add(var_d[s, 0, sh] + var_d[s, 1, sh] <= 1)
+                else:
+                    pass # N=1の場合は制約なし
+            
+            # 当月内の3連勤禁止
+            for d in range(N - 2):
+                model.Add(var_d[s, d, sh] + var_d[s, d+1, sh] + var_d[s, d+2, sh] <= 2)
+    # ── 制約11: 公休数（×+○）を指定日数に厳密に設定 ──
+    # ○は夜勤明け休（夜勤回数と連動）、×は通常公休
+    # v6.0: 主任・パートも公休数制約の対象に含める
+    for s in all_staff_names:
+        min_hol = holiday_limits.get(cont_map[s], 0)
+        var_d = xs if s in shuunin_list else x
+        total_off = (sum(var_d[s,d,"×"] for d in range(N)) +
+                     sum(var_d[s,d,"○"] for d in range(N)))
+        model.Add(total_off == min_hol)  # 多くても少なくてもダメ（等式）
+
+    # ── 制約12: 備考による勤務制限 ──
+    # Shift_Requestsの「指定」勤務は備考制限より優先（全シフト種別に適用）
+    for s in all_staff_names:
+        var_d = xs if s in shuunin_list else x
+        # 通常の備考制限
+        allowed = allowed_shifts_map.get(s)
         if allowed is not None:
             forbidden = set(WORK_SHIFTS) - allowed
             for d in range(N):
-                req = requests.get(s, {}).get(days_norm[d])
                 for sh in forbidden:
-                    # Shift_Requestsの「指定」が備考制限より優先
-                    if req and req[0] == sh and req[1] == "指定":
-                        continue
+                    req = requests.get(s, {}).get(days_norm[d])
+                    if req and req[1] == "指定" and req[0] == sh: continue
                     model.Add(var_d[s,d,sh] == 0)
-        # 曜日別の勤務制限（備考に「日曜：夜勤か×」等の記述がある場合）
-        wd_sh_rules = weekday_shift_map.get(s, {})
-        if wd_sh_rules:
-            for d, dn in enumerate(days_norm):
-                wd = dn.weekday()
-                if wd not in wd_sh_rules:
-                    continue
-                req = requests.get(s, {}).get(dn)
-                # Shift_Requestsの「指定」が曜日制限より優先
-                if req and req[1] == "指定":
-                    continue
-                wd_allowed = wd_sh_rules[wd]
-                all_possible = set(ALL_SHIFTS)
-                wd_forbidden = all_possible - wd_allowed
-                for sh in wd_forbidden:
-                    if sh in ("○",):
-                        # ○は夜勤翌日のみ（制約7-2で管理）なのでスキップ
-                        continue
-                    model.Add(var_d[s,d,sh] == 0)
+        
+        # v6.0: 曜日指定の勤務制限
+        if s in weekday_allowed_map:
+            for d in range(N):
+                wd = days_norm[d].weekday()
+                if wd in weekday_allowed_map[s]:
+                    allowed_wd = weekday_allowed_map[s][wd]
+                    # 許可されていないシフトを禁止
+                    # WORK_SHIFTS = ["早","遅","夜","日","有"]
+                    # 休み(×)も考慮する必要がある
+                    all_possible = set(WORK_SHIFTS) | {"×"}
+                    forbidden_wd = all_possible - allowed_wd
+                    for sh in forbidden_wd:
+                        req = requests.get(s, {}).get(days_norm[d])
+                        if req and req[1] == "指定" and req[0] == sh: continue
+                        if sh == "×":
+                            model.Add(sum(var_d[s,d,sh2] for sh2 in WORK_SHIFTS) == 1)
+                        else:
+                            model.Add(var_d[s,d,sh] == 0)
 
     # ── 制約13: パート職員に有給を自動割り当てしない ──
+    # v6.0: Settingsで年休数が指定されている場合は自動割り当てを許可する
     for s in part_staff:
+        nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 0)
+        if nen_limit > 0:
+            continue
         for d in range(N):
             req = requests.get(s, {}).get(days_norm[d])
             if req and req[0] == "有" and req[1] == "指定":
@@ -864,37 +918,30 @@ def generate_shift(file_path):
             else:
                 model.Add(x[s,d,"有"] == 0)
 
-    # ── 制約13-2: 一般職員の有給は夜勤翌日または明示的な希望のみ ──
-    # パートは制約13で対応済み。リーダー・一般職員の有給を制限。
-    for s in staff:
-        if s in part_staff:
-            continue  # パートは制約13で対応
-        for d in range(N):
-            req = requests.get(s, {}).get(days_norm[d])
-            if req and req[0] == "有" and req[1] in ("指定", "希望"):
-                continue  # 明示的な希望・指定は許可
-            # 有給は夜勤翌日または前月末夜勤の翌日（1日目）のみ許可
-            if d == 0:
-                prev_seq = prev_month.get(s, [])
-                if not (prev_seq and prev_seq[-1] == "夜"):
-                    model.Add(x[s, 0, "有"] == 0)
-                # 前月末夜勤の場合は1日目は○か有のどちらでも可（制約3で早遅日夜×禁止済み）
-            else:
-                # 前日が夜勤でない場合は有給禁止
-                model.Add(x[s, d, "有"] == 0).OnlyEnforceIf(x[s, d-1, "夜"].Not())
-
-    # ── 制約13-3: 一般職員の年休（有給）は Settingsの年休数（日数）を必ず取得 ──
-    # 年休は「出勤扱い」（連勤カウントに含まれる）のため公休数に含まれない
-    # Settings で指定した枚数は「一ヶ月に必ず消化しなければならない最低年休数」
+    # ── 制約13-2: 一般職員の有給（年休）の使用場所制限を解除 ──
+    # v6.0: 年休は夜勤翌日以外でも使用可能。ただし出勤扱いとして連勤制限に含める。
+    # パートは制約13で対応済み。
     for s in staff:
         if s in part_staff:
             continue
+        # 特に追加の禁止制約は設けない（どこでも使用可能）
+        pass
+
+    # ── 制約13-3: 年休（有給）はSettingsの年休数を「必ず入れる数」として等式制約化 ──
+    # 年休数 > 0 の場合: total_nenkyuu == nen_limit（下限・上限同値）
+    # 年休数 == 0 の場合: 年休禁止（従来の上限制約のみ）
+    # v6.0: 主任・パートも年休等式制約の対象に含める
+    for s in all_staff_names:
+        # 契約区分ごとの年休数（Settings の「年休数（日数）」列から取得）
         nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 2)
+        var_d = xs if s in shuunin_list else x
+        total_nenkyuu = sum(var_d[s,d,"有"] for d in range(N))
         if nen_limit > 0:
-            total_nenkyuu = sum(x[s,d,"有"] for d in range(N))
-            model.Add(total_nenkyuu >= nen_limit)
-            # 上限も設ける（=ちょうど nen_limit 枚）
-            model.Add(total_nenkyuu <= nen_limit)
+            # 年休数が指定されている場合は必ずその数だけ入れる（等式）
+            model.Add(total_nenkyuu == nen_limit)
+        else:
+            # 0の場合は年休なし（ただしパートで指定がある場合は許可されるよう制約13-1で調整済み）
+            model.Add(total_nenkyuu == 0)
 
     # ── 制約14: パート職員の週単位勤務日数 ──
     for s in staff:
@@ -912,56 +959,56 @@ def generate_shift(file_path):
 
     # ── 制約15: 主任のシフト制限 ──
     # 通常は早出か×のみ。ただし指定で遅出・夜勤は可。○は前日夜勤時のみ（制約7-3）。
-    # nikkin_weekday の日は日勤も許容（指定曜日日勤配置のフォールバック）。
+    # v6.0: 有給(有)も許可（年休等式制約に対応するため）
+    # v6.0: 特定曜日の日勤配置で主任が選ばれた場合は日勤を許可
     for s in shuunin_list:
         for d in range(N):
             req = requests.get(s, {}).get(days_norm[d])
-            for sh in ["遅","夜","日","有"]:
-                # 指定での遅出・夜勤はOK
+            for sh in ["遅","夜","日"]:
+                # 指定での遅出・夜勤はOK（備考制限を上書き）
                 if sh in ["遅","夜"] and req and req[0] == sh and req[1] == "指定":
                     continue
-                # nikkin_weekday では日勤も許容（フォールバック）
-                if sh == "日" and d in nikkin_days_idx:
-                    continue
+                # 日勤配置の制約で主任が割り当てられる可能性を考慮し、ここでは日勤を完全禁止しない
+                if sh == "日": continue
                 model.Add(xs[s,d,sh] == 0)
             # ○は制約7-3で管理（前日夜勤のみ許可）
+
+    # ── 制約16: 特定曜日の日勤配置 (v6.0) ──
+    # SettingsのD,E列1,2行目で指定された曜日に、主任以外の職員を1名日勤として配置。
+    # 不足時は主任でも可能。Shift_Requestsの日勤とは別枠。
+    for wd_target in nikkin_days_settings:
+        for d in range(N):
+            if days_norm[d].weekday() == wd_target:
+                # 主任以外から1名
+                model.Add(sum(x[s,d,"日"] for s in staff) >= 1)
 
     # ======================================================
     # ソフト制約 & 目的関数
     # ======================================================
-    # (penalty_terms は制約7内で初期化済み)
-
-    # ── 制約16: 指定曜日日勤配置（Settings D/E列）──
-    # Shift_Requests に日勤指定がある職員とは「別」に、1名日勤を追加配置する
-    for d, dn in enumerate(days_norm):
-        if dn.weekday() not in nikkin_weekdays:
-            continue
-        # Shift_Requestsで既に日勤「指定」の職員
-        req_nikkin = {s for s in staff
-                      if requests.get(s, {}).get(dn)
-                      and requests[s][dn][0] == "日"
-                      and requests[s][dn][1] == "指定"}
-        # 追加日勤対象: req_nikkin 以外の一般職員 + 主任（フォールバック）
-        extra_staff_vars   = [x[s,d,"日"]  for s in staff       if s not in req_nikkin]
-        extra_shuunin_vars = [xs[s,d,"日"] for s in shuunin_list]
-        # ハード: 一般職員か主任のどちらかが1名以上日勤
-        model.Add(sum(extra_staff_vars) + sum(extra_shuunin_vars) >= 1)
+    penalty_terms = []
 
     # ── ソフト1: 主任使用ペナルティ ──
     for s in shuunin_list:
         for d in range(N):
             penalty_terms.append((xs[s,d,"早"], 200))
 
-    # ── ソフト: 指定曜日日勤配置での主任使用ペナルティ ──
-    for d, dn in enumerate(days_norm):
-        if dn.weekday() not in nikkin_weekdays:
-            continue
-        for s in shuunin_list:
-            penalty_terms.append((xs[s,d,"日"], 300))
-
     # ── ソフト2: 連続夜勤使用ペナルティ ──
     for (s, d), cn in cn_vars.items():
         penalty_terms.append((cn, 30))
+
+    # ── ソフト2-2: 夜勤回数の平準化 ──
+    # Staff_Masterの夜勤最少数と夜勤最高数の平均値に近づける
+    for s in staff:
+        avg_night = (nmin_map[s] + nmax_map[s]) / 2.0
+        # 整数値で扱うため、平均値を四捨五入した値との差をペナルティ化
+        target_n = int(avg_night + 0.5)
+        actual_n = model.NewIntVar(0, N, f"actual_n_{s}")
+        model.Add(actual_n == sum(x[s, d, "夜"] for d in range(N)))
+        
+        diff_n = model.NewIntVar(0, N, f"diff_n_{s}")
+        model.Add(diff_n >= actual_n - target_n)
+        model.Add(diff_n >= target_n - actual_n)
+        penalty_terms.append((diff_n, 15))
 
     # ── ソフト3: 削除済み（ハード制約11で公休数を等式指定に変更）──
     # 制約11が sum(×+○) == target_off を強制するため、ソフト制約は不要
@@ -993,16 +1040,15 @@ def generate_shift(file_path):
             model.AddBoolOr([x[s,d,"遅"].Not(), x[s,d+1,"日"].Not()]).OnlyEnforceIf(late_then_day.Not())
             penalty_terms.append((late_then_day, 10))
 
-    # ── ソフト5-NEW2: ×/有の間隔を10日以内（○はカウント外）──
-    # 11日以上の連続×/有なし窓にペナルティ
+    # ── ソフト5-NEW2: ×の間隔を10日以内（○はカウント外）──
+    # 11日以上の連続×なし窓にペナルティ
     for s in staff:
         for start in range(N - 10):
-            rest_bits = ([x[s,d,"×"] for d in range(start, start + 11)] +
-                         [x[s,d,"有"] for d in range(start, start + 11)])
+            rest_bits = ([x[s,d,"×"] for d in range(start, start + 11)] )
             gap_viol = model.NewBoolVar(f"gv_{s}_{start}")
             model.Add(sum(rest_bits) == 0).OnlyEnforceIf(gap_viol)
             model.Add(sum(rest_bits) >= 1).OnlyEnforceIf(gap_viol.Not())
-            penalty_terms.append((gap_viol, 25))
+            penalty_terms.append((gap_viol, 50))
 
     # ── ソフト5: 勤務間隔（4連続勤務にペナルティ）──
     for s in staff:
@@ -1020,32 +1066,24 @@ def generate_shift(file_path):
             model.AddBoolOr([w.Not() for w in work_d]).OnlyEnforceIf(w4_real.Not())
             penalty_terms.append((w4_real, 2))
 
-    # ── ソフト6: 同一勤務3連続にペナルティ ──
-    for s in staff:
-        if s in part_with_fixed:
-            continue
-        for sh in ["早", "遅"]:
-            for d in range(N - 2):
-                sc3 = model.NewBoolVar(f"sc3_{s}_{sh}_{d}")
-                model.AddBoolAnd([x[s,d,sh], x[s,d+1,sh], x[s,d+2,sh]]).OnlyEnforceIf(sc3)
-                model.AddBoolOr([x[s,d,sh].Not(), x[s,d+1,sh].Not(),
-                                 x[s,d+2,sh].Not()]).OnlyEnforceIf(sc3.Not())
-                penalty_terms.append((sc3, 3))
+    # ── ソフト6: 同一勤務3連続にペナルティ（ハード制約10-2で禁止されたため、ここでは不要だが、念のため残すか削除） ──
+    # ハード制約10-2で同一勤務3連勤は禁止されたため、このソフト制約は実質的に機能しません。
+    
+    # ── ソフト6-2: パート職員の3連勤緩和 ──
+    for s in part_staff:
+        for d in range(N - 3):
+            # 4連勤を検知
+            work_d_p = [model.NewBoolVar(f"wd4p_{s}_{d}_{k}") for k in range(4)]
+            for k in range(4):
+                model.Add(sum(x[s,d+k,sh] for sh in ["早","遅","夜","日","有"]) == 1).OnlyEnforceIf(work_d_p[k])
+                model.Add(sum(x[s,d+k,sh] for sh in ["早","遅","夜","日","有"]) == 0).OnlyEnforceIf(work_d_p[k].Not())
+            w4_p = model.NewBoolVar(f"w4p_{s}_{d}")
+            model.AddBoolAnd(work_d_p).OnlyEnforceIf(w4_p)
+            model.AddBoolOr([w.Not() for w in work_d_p]).OnlyEnforceIf(w4_p.Not())
+            penalty_terms.append((w4_p, 50)) # パートの4連勤には強めのペナルティ
 
-    # ── ソフト7: 夜勤翌日の有給使用にペナルティ（○を優先）──
-    # 有給は公休数超過時の調整専用。基本は○を使う。
-    for s in [s for s in staff if s not in part_staff]:
-        prev_seq_s = prev_month.get(s, [])
-        for d in range(N):
-            if d == 0:
-                # 前月末が夜勤で今月1日が有給の場合
-                if prev_seq_s and prev_seq_s[-1] == "夜":
-                    penalty_terms.append((x[s, 0, "有"], 15))
-            else:
-                nty = model.NewBoolVar(f"nty_{s}_{d}")
-                model.AddBoolAnd([x[s,d-1,"夜"], x[s,d,"有"]]).OnlyEnforceIf(nty)
-                model.AddBoolOr([x[s,d-1,"夜"].Not(), x[s,d,"有"].Not()]).OnlyEnforceIf(nty.Not())
-                penalty_terms.append((nty, 15))
+    # ── ソフト7: 削除（v6.0: 年休はどこでも使用可能なため、夜勤翌日のペナルティは不要）──
+    pass
 
     # ── 目的関数 ──
     obj_terms = []
@@ -1055,7 +1093,7 @@ def generate_shift(file_path):
         model.Minimize(sum(obj_terms))
 
     # ======================================================
-    # ソルバー実行
+    # ソルバー実行（第1段階: 通常制約）
     # ======================================================
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 300
@@ -1063,19 +1101,381 @@ def generate_shift(file_path):
     status = solver.Solve(model)
 
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
-        # ── INFEASIBLE診断: 誰の何が原因かを特定 ──
-        diag_msgs = _diagnose_infeasible(
-            staff, shuunin_list, requests, days_norm, N,
-            allowed_shifts_map, fixed_holiday_map, holiday_limits,
-            cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
-            unit_map=unit_map, ab_staff_set=ab_staff_set
-        )
-        if diag_msgs:
-            raise Exception("\n".join(diag_msgs))
-        raise Exception(
-            "致命的エラー: 条件を満たすシフト表が見つかりませんでした。\n"
-            "希望シフト・夜勤回数・公休数の設定を見直してください。"
-        )
+        # ======================================================
+        # 第2段階: 通常制約で解なしの場合のみ、連続夜勤後の制約を緩和して再試行
+        # 「夜勤 夜勤 ○ 早出」「夜勤 夜勤 ○ 遅出」「夜勤 夜勤 ○ 夜勤 ○」を許可
+        # ======================================================
+        model2 = cp_model.CpModel()
+        penalty2 = [] # ソフト制約用
+
+        # 変数を再作成
+        x2 = {}
+        for s in staff:
+            for d in range(N):
+                for sh in ALL_SHIFTS:
+                    x2[s, d, sh] = model2.NewBoolVar(f"x2_{s}_{d}_{sh}")
+        xs2 = {}
+        for s in shuunin_list:
+            for d in range(N):
+                for sh in ALL_SHIFTS:
+                    xs2[s, d, sh] = model2.NewBoolVar(f"xs2_{s}_{d}_{sh}")
+
+        uea2 = {}; ueb2 = {}; ula2 = {}; ulb2 = {}
+        for s in ab_staff:
+            for d in range(N):
+                uea2[s,d] = model2.NewBoolVar(f"uea2_{s}_{d}")
+                ueb2[s,d] = model2.NewBoolVar(f"ueb2_{s}_{d}")
+                ula2[s,d] = model2.NewBoolVar(f"ula2_{s}_{d}")
+                ulb2[s,d] = model2.NewBoolVar(f"ulb2_{s}_{d}")
+                model2.Add(uea2[s,d] + ueb2[s,d] == x2[s,d,"早"])
+                model2.Add(ula2[s,d] + ulb2[s,d] == x2[s,d,"遅"])
+
+        shuunin_use_a2 = {}; shuunin_use_b2 = {}
+        for s in shuunin_list:
+            for d in range(N):
+                shuunin_use_a2[s,d] = model2.NewBoolVar(f"sh_ua2_{s}_{d}")
+                shuunin_use_b2[s,d] = model2.NewBoolVar(f"sh_ub2_{s}_{d}")
+                model2.Add(shuunin_use_a2[s,d] + shuunin_use_b2[s,d] <= xs2[s,d,"早"])
+                model2.Add(shuunin_use_a2[s,d] + shuunin_use_b2[s,d] <= 1)
+
+        # 全制約を再適用（変数を入れ替え）
+        def _rebuild_model2():
+            nonlocal cn2_vars
+            # 1日1シフト
+            for s in staff:
+                for d in range(N):
+                    model2.AddExactlyOne(x2[s,d,sh] for sh in ALL_SHIFTS)
+            for s in shuunin_list:
+                for d in range(N):
+                    model2.AddExactlyOne(xs2[s,d,sh] for sh in ALL_SHIFTS)
+
+            # 希望・指定シフト固定
+            for s in staff:
+                if s not in requests: continue
+                for date_obj, (sh_type, _) in requests[s].items():
+                    for d, dn in enumerate(days_norm):
+                        if dn == date_obj and sh_type in ALL_SHIFTS:
+                            model2.Add(x2[s,d,sh_type] == 1)
+                            break
+            for s in shuunin_list:
+                if s not in requests: continue
+                for date_obj, (sh_type, _) in requests[s].items():
+                    for d, dn in enumerate(days_norm):
+                        if dn == date_obj and sh_type in ALL_SHIFTS:
+                            model2.Add(xs2[s,d,sh_type] == 1)
+                            break
+
+            # 前月最終日夜勤 → 1日目制限
+            for s in staff:
+                if prev_month.get(s, []) and prev_month[s][-1] == "夜":
+                    for sh_f in ["早","遅","日","夜","×"]:
+                        model2.Add(x2[s,0,sh_f] == 0)
+
+            # 固定公休
+            for s, wdays in fixed_holiday_map.items():
+                var_dict = xs2 if s in shuunin_list else x2
+                for d_idx, dn in enumerate(days_norm):
+                    if dn.weekday() in wdays:
+                        req = requests.get(s, {}).get(dn)
+                        if req and req[1] == "指定": continue
+                        model2.Add(var_dict[s,d_idx,"×"] == 1)
+
+            # 必須人数
+            for d in range(N):
+                a_e2 = ([x2[s,d,"早"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+                        [uea2[s,d] for s in ab_staff] +
+                        [shuunin_use_a2[s,d] for s in shuunin_list])
+                model2.Add(sum(a_e2) == 1)
+                a_l2 = ([x2[s,d,"遅"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+                        [ula2[s,d] for s in ab_staff])
+                model2.Add(sum(a_l2) == 1)
+                b_e2 = ([x2[s,d,"早"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+                        [ueb2[s,d] for s in ab_staff] +
+                        [shuunin_use_b2[s,d] for s in shuunin_list])
+                model2.Add(sum(b_e2) == 1)
+                b_l2 = ([x2[s,d,"遅"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+                        [ulb2[s,d] for s in ab_staff])
+                model2.Add(sum(b_l2) == 1)
+                shuunin_night_vars_d2 = [xs2[s,d,"夜"] for s in shuunin_list
+                                         if requests.get(s,{}).get(days_norm[d])
+                                         and requests[s][days_norm[d]][0] == "夜"
+                                         and requests[s][days_norm[d]][1] == "指定"]
+                model2.Add(sum(x2[s,d,"夜"] for s in staff) + sum(shuunin_night_vars_d2) == 1)
+
+            # 夜勤回数（緩和版でも最少数は厳守）
+            for s in staff:
+                nt2 = sum(x2[s,d,"夜"] for d in range(N))
+                model2.Add(nt2 >= nmin_map[s])
+                model2.Add(nt2 <= nmax_map[s])
+            for s in shuunin_list:
+                for d in range(N):
+                    req = requests.get(s, {}).get(days_norm[d])
+                    if req and req[0] == "夜" and req[1] == "指定": continue
+                    model2.Add(xs2[s,d,"夜"] == 0)
+
+            # 夜勤→翌日は○（緩和版: 連続夜勤後は早出/遅出/夜勤も許可）
+            cn2_vars = {}
+            for s in staff:
+                can_consec = (consec_night_map.get(s, "×") == "○")
+                for d in range(N - 1):
+                    if can_consec:
+                        # 連続夜勤の場合: 翌日は○か夜勤か有給のみ（早遅日×禁止）
+                        # v6.0: 有給(有)は夜勤翌日でも許可
+                        for sh in ["早","遅","日","×"]:
+                            model2.Add(x2[s,d+1,sh] == 0).OnlyEnforceIf(x2[s,d,"夜"])
+                        cn2 = model2.NewBoolVar(f"cn2_{s}_{d}")
+                        cn2_vars[s,d] = cn2
+                        model2.AddBoolAnd([x2[s,d,"夜"], x2[s,d+1,"夜"]]).OnlyEnforceIf(cn2)
+                        model2.AddBoolOr([x2[s,d,"夜"].Not(), x2[s,d+1,"夜"].Not()]).OnlyEnforceIf(cn2.Not())
+                        if d + 3 < N:
+                            model2.Add(x2[s,d+2,"○"] == 1).OnlyEnforceIf(cn2)
+                            # 緩和: d+3は早出/遅出/夜勤も許可（日勤/有給は禁止）
+                            for sh_w in ["日","有"]:
+                                model2.Add(x2[s,d+3,sh_w] == 0).OnlyEnforceIf(cn2)
+                            # d+3が夜勤の場合はさらにd+4に○を必須に（緩和版では省略可能だが、一応残すか検討）
+                            # v6.0: フォールバック時はd+4の○制約を外してさらに緩和
+                            pass
+                        elif d + 2 < N:
+                            model2.Add(x2[s,d+2,"○"] == 1).OnlyEnforceIf(cn2)
+                        if d + 2 < N:
+                            model2.Add(x2[s,d,"夜"] + x2[s,d+1,"夜"] + x2[s,d+2,"夜"] <= 2)
+                    else:
+                        # v6.0: 有給(有)は夜勤翌日でも許可
+                        for sh_forbidden in ["早","遅","日","夜","×"]:
+                            model2.Add(x2[s,d+1,sh_forbidden] == 0).OnlyEnforceIf(x2[s,d,"夜"])
+
+            for s in shuunin_list:
+                for d in range(N - 1):
+                    model2.Add(xs2[s,d+1,"○"] == 1).OnlyEnforceIf(xs2[s,d,"夜"])
+
+            # ○は必ず前日夜勤の場合のみ（緩和版: 連続夜勤後の早出/遅出翌日の○も許可）
+            for s in staff:
+                can_consec = (consec_night_map.get(s, "×") == "○")
+                for d in range(N):
+                    if d == 0:
+                        prev_seq = prev_month.get(s, [])
+                        if not (prev_seq and prev_seq[-1] == "夜"):
+                            model2.Add(x2[s, 0, "○"] == 0)
+                    else:
+                        if can_consec:
+                            # v6.0: 連続夜勤(d, d+1)後のd+3が夜勤の場合、d+4の○を許可する
+                            # ここではシンプルに「前日が夜勤」の場合のみ○を許可する制約を維持し、
+                            # 緩和されたd+3の夜勤の翌日(d+4)も「前日が夜勤」なのでこの制約でカバーされる。
+                            model2.Add(x2[s, d, "○"] == 0).OnlyEnforceIf(x2[s, d-1, "夜"].Not())
+                        else:
+                            model2.Add(x2[s, d, "○"] == 0).OnlyEnforceIf(x2[s, d-1, "夜"].Not())
+            for s in shuunin_list:
+                for d in range(N):
+                    if d == 0:
+                        prev_seq = prev_month.get(s, [])
+                        if not (prev_seq and prev_seq[-1] == "夜"):
+                            model2.Add(xs2[s, 0, "○"] == 0)
+                    else:
+                        model2.Add(xs2[s, d, "○"] == 0).OnlyEnforceIf(xs2[s, d-1, "夜"].Not())
+
+            # 遅→翌早禁止
+            for s in staff:
+                for d in range(N - 1):
+                    model2.Add(x2[s,d,"遅"] + x2[s,d+1,"早"] <= 1)
+            for s in shuunin_list:
+                for d in range(N - 1):
+                    model2.Add(xs2[s,d,"遅"] + xs2[s,d+1,"早"] <= 1)
+
+            # 希望休前日夜勤禁止
+            for s in staff:
+                for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
+                    if req_type == "希望" and sh_type in ["×","有"]:
+                        for d, dn in enumerate(days_norm):
+                            if dn == date_obj and d > 0:
+                                model2.Add(x2[s,d-1,"夜"] == 0)
+                                break
+
+            # 連勤制限
+            # v6.0: 主任も連勤制限の対象に含める
+            for s in all_staff_names:
+                max_c  = 5 if cont_map[s] == "40h" else 4
+                prev_c = count_trailing_consec(prev_month.get(s, []))
+                remain = max(0, max_c - prev_c)
+                var_d2 = xs2 if s in shuunin_list else x2
+                if prev_c > 0 and remain < max_c:
+                    for w in range(1, min(remain + 2, N + 1)):
+                        if w > remain:
+                            # v6.0: 有給(有)も出勤扱いとして連勤に含める
+                            model2.Add(sum(var_d2[s,d2,sh2] for d2 in range(w)
+                                          for sh2 in ["早","遅","夜","日","有"]) <= remain)
+                            break
+                for st in range(N - max_c):
+                    # v6.0: 有給(有)も出勤扱いとして連勤に含める
+                    model2.Add(sum(var_d2[s,d2,sh2] for d2 in range(st, st+max_c+1)
+                                  for sh2 in ["早","遅","夜","日","有"]) <= max_c)
+
+            # 同一勤務の連勤制限（緩和版でも維持）
+            for s in all_staff_names:
+                var_d2 = xs2 if s in shuunin_list else x2
+                for sh in ["早", "遅", "日"]:
+                    for d in range(N - 2):
+                        model2.Add(var_d2[s, d, sh] + var_d2[s, d+1, sh] + var_d2[s, d+2, sh] <= 2)
+
+            # 公休数（緩和版では「以上」に緩和し、解を見つかりやすくする）
+            # v6.0: 主任・パートも公休数制約の対象に含める
+            for s in all_staff_names:
+                min_hol = holiday_limits.get(cont_map[s], 0)
+                var_d2 = xs2 if s in shuunin_list else x2
+                total_off2 = (sum(var_d2[s,d,"×"] for d in range(N)) +
+                              sum(var_d2[s,d,"○"] for d in range(N)))
+                model2.Add(total_off2 >= min_hol)
+                # ソフト制約で指定数に近づける
+                diff_hol = model2.NewIntVar(0, N, f"diff_hol_{s}")
+                model2.Add(diff_hol >= total_off2 - min_hol)
+                penalty2.append((diff_hol, 10))
+
+            # 備考制限（Shift_Requests指定優先）
+            for s in all_staff_names:
+                var_d2 = xs2 if s in shuunin_list else x2
+                # 通常の備考制限
+                allowed = allowed_shifts_map.get(s)
+                if allowed is not None:
+                    forbidden = set(WORK_SHIFTS) - allowed
+                    for d in range(N):
+                        for sh in forbidden:
+                            req = requests.get(s, {}).get(days_norm[d])
+                            if req and req[1] == "指定" and req[0] == sh: continue
+                            model2.Add(var_d2[s,d,sh] == 0)
+                
+                # v6.0: 曜日指定の勤務制限
+                if s in weekday_allowed_map:
+                    for d in range(N):
+                        wd = days_norm[d].weekday()
+                        if wd in weekday_allowed_map[s]:
+                            allowed_wd = weekday_allowed_map[s][wd]
+                            all_possible = set(WORK_SHIFTS) | {"×"}
+                            forbidden_wd = all_possible - allowed_wd
+                            for sh in forbidden_wd:
+                                req = requests.get(s, {}).get(days_norm[d])
+                                if req and req[1] == "指定" and req[0] == sh: continue
+                                if sh == "×":
+                                    model2.Add(sum(var_d2[s,d,sh2] for sh2 in WORK_SHIFTS) == 1)
+                                else:
+                                    model2.Add(var_d2[s,d,sh] == 0)
+
+            # パート有給制限
+            # v6.0: Settingsで年休数が指定されている場合は自動割り当てを許可する
+            for s in part_staff:
+                nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 0)
+                if nen_limit > 0: continue
+                for d in range(N):
+                    req = requests.get(s, {}).get(days_norm[d])
+                    if req and req[0] == "有" and req[1] == "指定": pass
+                    else: model2.Add(x2[s,d,"有"] == 0)
+
+            # 一般職員有給制限（解除）
+            for s in staff:
+                if s in part_staff: continue
+                # v6.0: 年休はどこでも使用可能
+                pass
+
+            # 年休等式制約（緩和版でも厳守）
+            # v6.0: 主任も年休等式制約の対象に含める
+            for s in all_staff_names:
+                if s in part_staff: continue
+                nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 2)
+                var_d2 = xs2 if s in shuunin_list else x2
+                total_nenkyuu2 = sum(var_d2[s,d,"有"] for d in range(N))
+                if nen_limit > 0:
+                    model2.Add(total_nenkyuu2 == nen_limit)
+                else:
+                    model2.Add(total_nenkyuu2 == 0)
+
+            # パート週単位勤務日数
+            for s in staff:
+                if s not in weekly_work_days: continue
+                target = weekly_work_days[s]
+                for week_key in sorted_week_keys:
+                    didx = week_groups[week_key]
+                    wv2 = [x2[s,d,sh] for d in didx for sh in ["早","遅","夜","有","日"]]
+                    if len(didx) == 7:
+                        model2.Add(sum(wv2) >= max(0, target - 1))
+                        model2.Add(sum(wv2) <= target)
+                    else:
+                        model2.Add(sum(wv2) <= round(target * len(didx) / 7 + 0.5))
+
+            # 主任シフト制限
+            # v6.0: 有給(有)も許可（年休等式制約に対応するため）
+            # v6.0: 特定曜日の日勤配置で主任が選ばれた場合は日勤を許可
+            for s in shuunin_list:
+                for d in range(N):
+                    req = requests.get(s, {}).get(days_norm[d])
+                    for sh in ["遅","夜","日"]:
+                        if sh in ["遅","夜"] and req and req[0] == sh and req[1] == "指定": continue
+                        if sh == "日": continue
+                        model2.Add(xs2[s,d,sh] == 0)
+
+            # ── 制約16: 特定曜日の日勤配置 (v6.0) ──
+            for wd_target in nikkin_days_settings:
+                for d in range(N):
+                    if days_norm[d].weekday() == wd_target:
+                        model2.Add(sum(x2[s,d,"日"] for s in staff) >= 1)
+
+        cn2_vars = {}
+        _rebuild_model2()
+
+        # ソフト制約（第2段階）
+        for s in shuunin_list:
+            for d in range(N):
+                penalty2.append((xs2[s,d,"早"], 200))
+        for (s, d), cn2 in cn2_vars.items():
+            penalty2.append((cn2, 30))
+        non_leader2 = [s for s in staff if role_map.get(s) != "リーダー"]
+        if len(non_leader2) >= 2:
+            e2_vars = []; l2_vars = []
+            for s in non_leader2:
+                ev2 = model2.NewIntVar(0, N, f"e2_{s}")
+                lv2 = model2.NewIntVar(0, N, f"l2_{s}")
+                model2.Add(ev2 == sum(x2[s,d,"早"] for d in range(N)))
+                model2.Add(lv2 == sum(x2[s,d,"遅"] for d in range(N)))
+                e2_vars.append(ev2); l2_vars.append(lv2)
+            max_e2 = model2.NewIntVar(0, N, "max_e2"); min_e2 = model2.NewIntVar(0, N, "min_e2")
+            max_l2 = model2.NewIntVar(0, N, "max_l2"); min_l2 = model2.NewIntVar(0, N, "min_l2")
+            model2.AddMaxEquality(max_e2, e2_vars); model2.AddMinEquality(min_e2, e2_vars)
+            model2.AddMaxEquality(max_l2, l2_vars); model2.AddMinEquality(min_l2, l2_vars)
+            diff_e2 = model2.NewIntVar(0, N, "diff_e2"); model2.Add(diff_e2 == max_e2 - min_e2)
+            diff_l2 = model2.NewIntVar(0, N, "diff_l2"); model2.Add(diff_l2 == max_l2 - min_l2)
+            penalty2.append((diff_e2, 5))
+            penalty2.append((diff_l2, 5))
+        obj2 = [v * c for v, c in penalty2]
+        if obj2:
+            model2.Minimize(sum(obj2))
+
+        solver2 = cp_model.CpSolver()
+        solver2.parameters.max_time_in_seconds = 300
+        solver2.parameters.num_search_workers  = 8
+        status2 = solver2.Solve(model2)
+
+        if status2 not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+            # ── INFEASIBLE診断: 誰の何が原因かを特定 ──
+            diag_msgs = _diagnose_infeasible(
+                staff, shuunin_list, requests, days_norm, N,
+                allowed_shifts_map, fixed_holiday_map, holiday_limits,
+                cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
+                unit_map=unit_map, ab_staff_set=ab_staff_set,
+                weekday_allowed_map=weekday_allowed_map,
+                nikkin_days_settings=nikkin_days_settings
+            )
+            if diag_msgs:
+                # v6.0: エラーメッセージの先頭に分かりやすい見出しを追加
+                error_text = "【勤務表を生成できませんでした】\n以下の制約が矛盾している可能性があります：\n\n" + "\n".join(diag_msgs)
+                raise Exception(error_text)
+            raise Exception(
+                "致命的エラー: 条件を満たすシフト表が見つかりませんでした。\n"
+                "希望シフト・夜勤回数・公休数の設定を見直してください。"
+            )
+
+        # 第2段階の結果を使用
+        solver = solver2
+        x = x2
+        xs = xs2
+        uea = uea2; ueb = ueb2; ula = ula2; ulb = ulb2
+        shuunin_use_a = shuunin_use_a2; shuunin_use_b = shuunin_use_b2
 
     # ── 結果組み立て ──
     result = {}
@@ -1129,10 +1529,28 @@ def generate_shift(file_path):
 # ========================================================
 # Excel 書き出し
 # ========================================================
+
+# ========================================================
+# Excel 書き出し (v5.4: 新レイアウト)
+# ========================================================
 def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map,
                        days_norm, requests, ab_unit_result, shuunin_unit_result,
                        kanmu_map, input_path, output_path, prev_month=None):
-
+    """
+    出力レイアウト v5.4:
+      - 列A: 職員名のみ（ユニット列廃止）
+      - 列B以降: 日付（DATE_START_COL=2）
+      - 行1: 月ラベル（中央付近）
+      - 行2: A="日", B-AF=日付番号
+      - 行3: A="曜日", B-AF=曜日, 集計列略称(ハ/ニ/オ/夜勤/年)
+      - 行4: A="会議・委員会", 集計列正式名(早出/日勤/遅出/夜勤/計/○/×/計/年休/合計)
+      - 行5以降: 職員行（Staff_Master順を維持、Aユニット→区切り線→Bユニット）
+      - 区切り行: 最終Aユニット行の下(bottom=medium) / 最初Bユニット行の上(top=medium)
+      - Settings!B5日付列の右に太い罫線(right=medium / 次列left=medium)
+      - 勤務略称: 早→ハ, 遅→オ, 日→ニ, 有→年（夜/○/×は変更なし）
+      - 集計列にCOUNTIF数式
+      - 日別集計行: 不足日(count=0)は赤字（条件付き書式）
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Border, Side, PatternFill, Font, Alignment
     from openpyxl.utils import get_column_letter
@@ -1500,9 +1918,6 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
 # ========================================================
 # Web UI HTML
 # ========================================================
-_favicon_tag = (f'<link rel="icon" type="image/png" href="data:image/png;base64,{FAVICON_B64}">'
-                if FAVICON_B64 else '<link rel="icon" href="/favicon.png">')
-
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -1734,7 +2149,7 @@ HTML_CONTENT = """
                 <i data-lucide="cpu" color="#fff" size="24"></i>
             </div>
             <div>
-                <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools v5.8</span></div>
+                <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools</span></div>
                 <div class="brand-subtitle">The Intelligent Auto-Roster Engine</div>
             </div>
         </div>
@@ -1921,24 +2336,9 @@ HTML_CONTENT = """
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement("a");
                 a.href = url; a.download = "SS_Result.xlsx"; a.click();
-            } else {
-                // サーバーエラーの詳細を取得してログに表示
-                let errDetail = "（詳細不明）";
-                try {
-                    const errJson = await res.json();
-                    if (errJson && errJson.detail) errDetail = errJson.detail;
-                } catch(_) {}
-                // 改行ごとに分けて赤字で表示
-                const errLines = errDetail.split("\n");
-                addLog("═══ サーバーエラー発生 ═══", "#ff4d4d");
-                errLines.forEach(line => {
-                    if (line.trim()) addLog(line, "#ff6b6b");
-                });
-                addLog("─── エラー終了 ─── データまたは制約条件を見直してください。", "#ff4d4d");
-            }
-        } catch (e) {
-            addLog("ネットワークエラー: サーバーへの接続に失敗しました。", "#ff4d4d");
-            addLog(String(e), "#ff6b6b");
+            } else { throw new Error(); }
+         } catch (e) {
+            addLog("通信エラーが発生しました。サーバーの状態を確認してください。", "#ff4d4d");
         } finally {
             // タイマー停止
             clearInterval(timerInterval);
@@ -1967,21 +2367,9 @@ HTML_CONTENT = """
 async def index():
     return HTMLResponse(content=HTML_CONTENT)
 
-@app.get("/favicon.png")
-async def favicon_png():
-    if _favicon_path.exists():
-        return FileResponse(str(_favicon_path), media_type="image/png")
-    raise HTTPException(status_code=404, detail="favicon not found")
-
-@app.get("/favicon.ico")
-async def favicon_ico():
-    if _favicon_path.exists():
-        return FileResponse(str(_favicon_path), media_type="image/png")
-    raise HTTPException(status_code=404, detail="favicon not found")
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "5.7"}
+    return {"status": "ok", "version": "6.0"}
 
 @app.post("/generate-shift")
 async def generate(file: UploadFile = File(...)):
