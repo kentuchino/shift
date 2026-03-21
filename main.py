@@ -14,7 +14,7 @@ TEMP_DIR = "temp_files"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 WORK_SHIFTS = ["早", "遅", "夜", "日"]
-REST_SHIFTS  = ["×", "有", "○"]   # ○=夜勤明け休
+REST_SHIFTS  = ["×", "有", "○", "公", "△"]   # ○=夜勤明け日休み, ×=土休み, 公=公休(32h用), △=standalone日休み(土扱い)
 ALL_SHIFTS   = WORK_SHIFTS + REST_SHIFTS
 
 PINK_FILL   = PatternFill("solid", fgColor="FFB6C1")
@@ -41,6 +41,7 @@ def load_settings(df):
     holidays = {}
     nenkyuu = {}
     nikkin_days = []
+    holiday_periods = []
     
     try:
         for r in [1]: 
@@ -65,9 +66,12 @@ def load_settings(df):
         s_val = pd.to_datetime(df.iloc[j, 0], errors="coerce")
         e_val = pd.to_datetime(df.iloc[j, 1], errors="coerce")
         c = str(df.iloc[j, 2]).strip()
-        n_str = str(df.iloc[j, 3]).strip()
+        # D列=土, E列=日, F列=公, G列=年休（新列構造）
+        n_土_str  = str(df.iloc[j, 3]).strip() if df.shape[1] > 3 else ""
+        n_日_str  = str(df.iloc[j, 4]).strip() if df.shape[1] > 4 else ""
+        n_公_str  = str(df.iloc[j, 5]).strip() if df.shape[1] > 5 else ""
         try:
-            nen_str = str(df.iloc[j, 4]).strip() if df.shape[1] > 4 else ""
+            nen_str = str(df.iloc[j, 6]).strip() if df.shape[1] > 6 else ""
         except Exception:
             nen_str = ""
         if pd.isna(s_val) and pd.isna(e_val) and c in ["nan", "None", ""]:
@@ -76,16 +80,29 @@ def load_settings(df):
             start = s_val if start is None else min(start, s_val)
         if pd.notna(e_val):
             end = e_val if end is None else max(end, e_val)
-            
-        m = re.search(r"\d+", n_str)
-        if m and c not in ["nan", "None", ""]:
-            num = int(m.group())
+
+        m_土 = re.search(r"\d+", n_土_str)
+        m_日 = re.search(r"\d+", n_日_str)
+        m_公 = re.search(r"\d+", n_公_str)
+        if (m_土 or m_日 or m_公) and c not in ["nan", "None", ""]:
+            n_土 = int(m_土.group()) if m_土 else 0
+            n_日 = int(m_日.group()) if m_日 else 0
+            n_公 = int(m_公.group()) if m_公 else 0
+            num  = n_土 + n_日 + n_公
+            p_start_dt = s_val.to_pydatetime().replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0) if pd.notna(s_val) else None
+            p_end_dt   = e_val.to_pydatetime().replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0) if pd.notna(e_val) else None
             if "40" in c:
                 holidays["40h"] = holidays.get("40h", 0) + num
+                if p_start_dt and p_end_dt:
+                    holiday_periods.append((p_start_dt, p_end_dt, "40h", n_土, n_日, n_公))
             elif "32" in c:
                 holidays["32h"] = holidays.get("32h", 0) + num
+                if p_start_dt and p_end_dt:
+                    holiday_periods.append((p_start_dt, p_end_dt, "32h", n_土, n_日, n_公))
             elif "パート" in c:
                 holidays["パート"] = holidays.get("パート", 0) + num
+                if p_start_dt and p_end_dt:
+                    holiday_periods.append((p_start_dt, p_end_dt, "パート", n_土, n_日, n_公))
                 
         nen_m = re.search(r"\d+", nen_str)
         if nen_m and c not in ["nan", "None", ""]:
@@ -119,7 +136,7 @@ def load_settings(df):
     while d <= end:
         days.append(d)
         d += timedelta(days=1)
-    return days, holidays, nenkyuu, nikkin_days
+    return days, holidays, nenkyuu, nikkin_days, holiday_periods
 
 
 # ========================================================
@@ -156,8 +173,10 @@ def load_requests(df, days, staff_list, part_staff=None):
             raw = str(df.iloc[i, j]).strip()
             if raw in ["nan", "None", "", "0"]:
                 continue
-            if "×" in raw or "休み" in raw:
+            if "×" in raw or "土" in raw or "休み" in raw:
                 requests[name][date] = ("×", "希望")
+            elif raw == "公" or "公休" in raw:
+                requests[name][date] = ("公", "希望")
             elif "有給" in raw or raw in ("有", "年") or "年休" in raw:
                 requests[name][date] = ("有", "指定" if is_part else "希望")
             elif "夜勤" in raw or raw == "夜":
@@ -166,8 +185,11 @@ def load_requests(df, days, staff_list, part_staff=None):
                 requests[name][date] = ("早", "指定")
             elif "遅出" in raw or raw in ("遅", "オ"):
                 requests[name][date] = ("遅", "指定")
-            elif "日勤" in raw or raw in ("日", "ニ"):
+            elif "日勤" in raw or raw == "ニ":
                 requests[name][date] = ("日", "指定")
+            elif raw == "日":
+                # 新システムでは「日」リクエスト=standalone日休み(△)。日勤はニで入力。
+                requests[name][date] = ("△", "希望")
     return requests
 
 
@@ -197,12 +219,17 @@ def load_prev_month(df, staff_list):
         seq = []
         for j in date_cols:
             raw = str(df.iloc[i, j]).strip()
-            if "夜勤" in raw or raw == "夜":                          seq.append("夜")
-            elif "早出" in raw or raw in ("早", "ハ"):                seq.append("早")
-            elif "遅出" in raw or raw in ("遅", "オ"):                seq.append("遅")
-            elif "日勤" in raw or raw in ("日", "ニ"):                seq.append("日")
-            elif "有給" in raw or raw in ("有", "年") or "年休" in raw: seq.append("有")
-            else:                                                      seq.append("×")
+            if "夜勤" in raw or raw == "夜":                               seq.append("夜")
+            elif "早出" in raw or raw in ("早", "ハ"):                     seq.append("早")
+            elif "遅出" in raw or raw in ("遅", "オ"):                     seq.append("遅")
+            elif "日勤" in raw or raw == "ニ":                             seq.append("日")
+            elif "有給" in raw or raw in ("有", "年") or "年休" in raw:    seq.append("有")
+            elif raw == "日":
+                # 直前が夜勤なら夜勤明け(○)、そうでなければstandalone日休み(△)
+                seq.append("○" if (seq and seq[-1] == "夜") else "△")
+            elif raw == "公":                                               seq.append("公")
+            elif raw == "土" or raw == "×":                                seq.append("×")
+            else:                                                           seq.append("×")
         prev[name] = seq
     return prev
 
@@ -235,7 +262,7 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
 
     SHIFT_NAME = {
         "早": "早出(ハ)", "遅": "遅出(オ)", "日": "日勤(ニ)",
-        "夜": "夜勤", "×": "休み(×)", "有": "年休(有)", "○": "明け(○)"
+        "夜": "夜勤", "×": "土休み(土)", "有": "年休(有)", "○": "日休み(日/夜勤明け)", "公": "公休(公)", "△": "日休み(日/単独)"
     }
 
     for s in staff:
@@ -267,16 +294,16 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
         for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
             if sh_type in ["遅","夜"] and req_type == "指定":
                 continue 
-            if sh_type in ["日","有","○"] and req_type == "指定":
+            if sh_type in ["日","有","○","公","△"] and req_type == "指定":
                 bad_reqs.append(
                     f"{date_obj.strftime('%m/%d')}({SHIFT_NAME.get(sh_type,sh_type)})指定")
         if bad_reqs:
             days_str = ", ".join(bad_reqs)
             add_msg(
                 f"致命的エラー: {s}さん（主任）への指定が矛盾しています。\n"
-                f"  主任は 早出(ハ)・遅出(オ)・夜勤・休み(×) のみ指定可能です。\n"
+                f"  主任は 早出(ハ)・遅出(オ)・夜勤・土休み(土) のみ指定可能です。\n"
                 f"  矛盾する指定: {days_str}\n"
-                f"  → Shift_Requestsシートで該当日を早出(ハ)・遅出(オ)・夜勤・休み(×)に変更してください。"
+                f"  → Shift_Requestsシートで該当日を早出(ハ)・遅出(オ)・夜勤・土休み(土)に変更してください。"
             )
 
     for s in staff:
@@ -285,7 +312,7 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
             continue
         hope_off_days = sum(
             1 for _date_obj, (sh_type, req_type) in requests.get(s, {}).items()
-            if sh_type in ["×", "有"] and req_type == "希望"
+            if sh_type in ["×", "有", "公", "△"] and req_type == "希望"
         )
         if hope_off_days > hol_limit:
             add_msg(
@@ -304,10 +331,10 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
         if hol > 0 and max_maru > hol:
             add_msg(
                 f"致命的エラー: {s}さん の 夜勤上限回数と公休数のバランスが取れていません"
-                f"（夜勤の翌日は休みになるため、勤務できる日数が足りません）。\n"
+                f"（夜勤の翌日は日休み(日)になるため、勤務できる日数が足りません）。\n"
                 f"  公休{hol}日 に対し 夜勤上限{nmax}回"
                 + ("＋前月末夜勤(+1)" if prev_night else "")
-                + f" = ○{max_maru}日必要ですが、×が{max_maru - hol}日不足します。\n"
+                + f" = 日(夜勤明け){max_maru}日必要ですが、{max_maru - hol}日不足します。\n"
                 f"  → 夜勤上限を{hol - (1 if prev_night else 0)}以下にするか、"
                 f"公休数を{max_maru}以上に増やしてください。"
             )
@@ -501,7 +528,7 @@ def generate_shift(file_path):
     staff = [s for s in all_staff_names if s not in shuunin_list]
     part_staff = [s for s in staff if cont_map[s] == "パート"]
 
-    days, holiday_limits, nenkyuu_limits, nikkin_days_settings = load_settings(settings_df)
+    days, holiday_limits, nenkyuu_limits, nikkin_days_settings, holiday_periods = load_settings(settings_df)
     N = len(days)
     all_names_for_req = all_staff_names
     requests   = load_requests(request_df, days, all_names_for_req, part_staff=part_staff)
@@ -693,7 +720,7 @@ def generate_shift(file_path):
         can_consec = (consec_night_map.get(s, "×") == "○")
         for d in range(N - 1):
             if can_consec:
-                for sh in ["早","遅","日","×"]:
+                for sh in ["早","遅","日","×","公","△"]:
                     model.Add(x[s,d+1,sh] == 0).OnlyEnforceIf(x[s,d,"夜"])
                 cn = model.NewBoolVar(f"cn_{s}_{d}")
                 cn_vars[s,d] = cn
@@ -708,7 +735,7 @@ def generate_shift(file_path):
                 if d + 2 < N:
                     model.Add(x[s,d,"夜"] + x[s,d+1,"夜"] + x[s,d+2,"夜"] <= 2)
             else:
-                for sh_forbidden in ["早","遅","日","夜","×"]:
+                for sh_forbidden in ["早","遅","日","夜","×","公","△"]:
                     model.Add(x[s,d+1,sh_forbidden] == 0).OnlyEnforceIf(x[s,d,"夜"])
         
         # 連続夜勤希望者は必ず1度(2連続)夜勤を入れる
@@ -727,6 +754,8 @@ def generate_shift(file_path):
                     model.Add(x[s, 0, "○"] == 0)
             else:
                 model.Add(x[s, d, "○"] == 0).OnlyEnforceIf(x[s, d-1, "夜"].Not())
+                # △(standalone日) は夜勤明けには使えない
+                model.Add(x[s, d, "△"] == 0).OnlyEnforceIf(x[s, d-1, "夜"])
 
     for s in shuunin_list:
         for d in range(N):
@@ -736,6 +765,7 @@ def generate_shift(file_path):
                     model.Add(xs[s, 0, "○"] == 0)
             else:
                 model.Add(xs[s, d, "○"] == 0).OnlyEnforceIf(xs[s, d-1, "夜"].Not())
+                model.Add(xs[s, d, "△"] == 0).OnlyEnforceIf(xs[s, d-1, "夜"])
 
     for s in staff:
         for d in range(N - 1):
@@ -746,7 +776,7 @@ def generate_shift(file_path):
 
     for s in staff:
         for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
-            if req_type == "希望" and sh_type in ["×","有"]:
+            if req_type == "希望" and sh_type in ["×","有","公","△"]:
                 for d, dn in enumerate(days_norm):
                     if dn == date_obj and d > 0:
                         model.Add(x[s,d-1,"夜"] == 0)
@@ -790,7 +820,9 @@ def generate_shift(file_path):
         min_hol = holiday_limits.get(cont_map[s], 0)
         var_d = xs if s in shuunin_list else x
         total_off = (sum(var_d[s,d,"×"] for d in range(N)) +
-                     sum(var_d[s,d,"○"] for d in range(N)))
+                     sum(var_d[s,d,"○"] for d in range(N)) +
+                     sum(var_d[s,d,"公"] for d in range(N)) +
+                     sum(var_d[s,d,"△"] for d in range(N)))
         if s in shuunin_list:
             model.Add(total_off >= min_hol)
         else:
@@ -833,6 +865,16 @@ def generate_shift(file_path):
             else:
                 model.Add(x[s,d,"有"] == 0)
 
+    # 「公」は 32h スタッフのみ使用可能（40h・パートは禁止）
+    for s in all_staff_names:
+        var_d = xs if s in shuunin_list else x
+        if cont_map.get(s, "40h") != "32h":
+            for d in range(N):
+                req = requests.get(s, {}).get(days_norm[d])
+                if req and req[1] == "指定" and req[0] == "公":
+                    continue
+                model.Add(var_d[s, d, "公"] == 0)
+
     for s in all_staff_names:
         nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 2)
         var_d = xs if s in shuunin_list else x
@@ -855,11 +897,11 @@ def generate_shift(file_path):
             else:
                 model.Add(sum(wv) <= round(target * len(didx) / 7 + 0.5))
 
-    # 主任は「日勤」を絶対に担当しない（指定がある場合のみ例外）
+    # 主任は「日勤」「△（standalone日休み）」「公」を担当しない（指定がある場合のみ例外）
     for s in shuunin_list:
         for d in range(N):
             req = requests.get(s, {}).get(days_norm[d])
-            for sh in ["遅","夜","日"]:
+            for sh in ["遅","夜","日","△","公"]:
                 if sh in ["遅","夜"] and req and req[0] == sh and req[1] == "指定":
                     continue
                 model.Add(xs[s,d,sh] == 0)
@@ -870,6 +912,58 @@ def generate_shift(file_path):
                 model.Add(sum(x[s,d,"日"] for s in staff) >= 1)
 
     penalty_terms = []
+
+    # 期間別公休数制約（土/日/公 それぞれ個別に強制）
+    # 土 = × のみ、日 = ○(夜勤明け) + △(standalone日)、公 = 公
+    for s in all_staff_names:
+        var_d = xs if s in shuunin_list else x
+        s_type = cont_map.get(s, "40h")
+        for (p_start, p_end, p_type, n_土, n_日, n_公) in holiday_periods:
+            if p_type != s_type:
+                continue
+            period_d_indices = [d for d, dn in enumerate(days_norm) if p_start <= dn <= p_end]
+            if not period_d_indices:
+                continue
+            period_土 = sum(var_d[s,d,"×"] for d in period_d_indices)
+            period_日 = (sum(var_d[s,d,"○"] for d in period_d_indices) +
+                         sum(var_d[s,d,"△"] for d in period_d_indices))
+            period_公 = sum(var_d[s,d,"公"] for d in period_d_indices)
+            period_off = period_土 + period_日 + period_公
+            p_count = n_土 + n_日 + n_公
+            if s in shuunin_list:
+                model.Add(period_off >= p_count)
+            else:
+                # ハード下限 + 超過をペナルティ化
+                if n_土 > 0:
+                    model.Add(period_土 >= n_土)
+                    diff_土 = model.NewIntVar(0, N, f"m1_diff_土_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_土 >= period_土 - n_土)
+                    penalty_terms.append((diff_土, 500))
+                else:
+                    diff_土0 = model.NewIntVar(0, N, f"m1_diff_土0_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_土0 == period_土)
+                    penalty_terms.append((diff_土0, 500))
+                if n_日 > 0:
+                    model.Add(period_日 >= n_日)
+                    diff_日 = model.NewIntVar(0, N, f"m1_diff_日_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_日 >= period_日 - n_日)
+                    penalty_terms.append((diff_日, 500))
+                else:
+                    diff_日0 = model.NewIntVar(0, N, f"m1_diff_日0_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_日0 == period_日)
+                    penalty_terms.append((diff_日0, 500))
+                if n_公 > 0:
+                    model.Add(period_公 >= n_公)
+                    diff_公 = model.NewIntVar(0, N, f"m1_diff_公_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_公 >= period_公 - n_公)
+                    penalty_terms.append((diff_公, 500))
+                else:
+                    diff_公0 = model.NewIntVar(0, N, f"m1_diff_公0_{s}_{p_type}_{p_start.day}")
+                    model.Add(diff_公0 == period_公)
+                    penalty_terms.append((diff_公0, 500))
+                diff_tot = model.NewIntVar(0, N, f"m1_diff_tot_{s}_{p_type}_{p_start.day}")
+                model.Add(diff_tot >= period_off - p_count)
+                penalty_terms.append((diff_tot, 10))
 
     # 主任使用ペナルティ（究極の最終手段として極大設定）
     for s in shuunin_list:
@@ -914,7 +1008,9 @@ def generate_shift(file_path):
 
     for s in staff:
         for start in range(N - 10):
-            rest_bits = ([x[s,d,"×"] for d in range(start, start + 11)] )
+            rest_bits = ([x[s,d,"×"] for d in range(start, start + 11)] +
+                         [x[s,d,"公"] for d in range(start, start + 11)] +
+                         [x[s,d,"△"] for d in range(start, start + 11)])
             gap_viol = model.NewBoolVar(f"gv_{s}_{start}")
             model.Add(sum(rest_bits) == 0).OnlyEnforceIf(gap_viol)
             model.Add(sum(rest_bits) >= 1).OnlyEnforceIf(gap_viol.Not())
@@ -1063,7 +1159,7 @@ def generate_shift(file_path):
                 can_consec = (consec_night_map.get(s, "×") == "○")
                 for d in range(N - 1):
                     if can_consec:
-                        for sh in ["早","遅","日","×"]:
+                        for sh in ["早","遅","日","×","公","△"]:
                             model2.Add(x2[s,d+1,sh] == 0).OnlyEnforceIf(x2[s,d,"夜"])
                         cn2 = model2.NewBoolVar(f"cn2_{s}_{d}")
                         cn2_vars[s,d] = cn2
@@ -1078,7 +1174,7 @@ def generate_shift(file_path):
                         if d + 2 < N:
                             model2.Add(x2[s,d,"夜"] + x2[s,d+1,"夜"] + x2[s,d+2,"夜"] <= 2)
                     else:
-                        for sh_forbidden in ["早","遅","日","夜","×"]:
+                        for sh_forbidden in ["早","遅","日","夜","×","公","△"]:
                             model2.Add(x2[s,d+1,sh_forbidden] == 0).OnlyEnforceIf(x2[s,d,"夜"])
                 if can_consec:
                     model2.Add(sum(cn2_vars[s,d] for d in range(N-1)) == 1)
@@ -1095,6 +1191,7 @@ def generate_shift(file_path):
                             model2.Add(x2[s, 0, "○"] == 0)
                     else:
                         model2.Add(x2[s, d, "○"] == 0).OnlyEnforceIf(x2[s, d-1, "夜"].Not())
+                        model2.Add(x2[s, d, "△"] == 0).OnlyEnforceIf(x2[s, d-1, "夜"])
             for s in shuunin_list:
                 for d in range(N):
                     if d == 0:
@@ -1103,6 +1200,7 @@ def generate_shift(file_path):
                             model2.Add(xs2[s, 0, "○"] == 0)
                     else:
                         model2.Add(xs2[s, d, "○"] == 0).OnlyEnforceIf(xs2[s, d-1, "夜"].Not())
+                        model2.Add(xs2[s, d, "△"] == 0).OnlyEnforceIf(xs2[s, d-1, "夜"])
 
             for s in staff:
                 for d in range(N - 1):
@@ -1113,7 +1211,7 @@ def generate_shift(file_path):
 
             for s in staff:
                 for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
-                    if req_type == "希望" and sh_type in ["×","有"]:
+                    if req_type == "希望" and sh_type in ["×","有","公","△"]:
                         for d, dn in enumerate(days_norm):
                             if dn == date_obj and d > 0:
                                 model2.Add(x2[s,d-1,"夜"] == 0)
@@ -1144,12 +1242,68 @@ def generate_shift(file_path):
                 min_hol = holiday_limits.get(cont_map[s], 0)
                 var_d2 = xs2 if s in shuunin_list else x2
                 total_off2 = (sum(var_d2[s,d,"×"] for d in range(N)) +
-                              sum(var_d2[s,d,"○"] for d in range(N)))
+                              sum(var_d2[s,d,"○"] for d in range(N)) +
+                              sum(var_d2[s,d,"公"] for d in range(N)) +
+                              sum(var_d2[s,d,"△"] for d in range(N)))
                 model2.Add(total_off2 >= min_hol)
                 if s not in shuunin_list:
                     diff_hol = model2.NewIntVar(0, N, f"diff_hol_{s}")
                     model2.Add(diff_hol >= total_off2 - min_hol)
                     penalty2.append((diff_hol, 10))
+
+            # 期間別公休数制約（土/日/公 それぞれ個別に、model2）
+            # 土 = × のみ、日 = ○(夜勤明け) + △(standalone日)
+            for s in all_staff_names:
+                var_d2 = xs2 if s in shuunin_list else x2
+                s_type = cont_map.get(s, "40h")
+                for (p_start, p_end, p_type, n_土, n_日, n_公) in holiday_periods:
+                    if p_type != s_type:
+                        continue
+                    period_d_indices2 = [d for d, dn in enumerate(days_norm) if p_start <= dn <= p_end]
+                    if not period_d_indices2:
+                        continue
+                    p_土2 = sum(var_d2[s,d,"×"] for d in period_d_indices2)
+                    p_日2 = (sum(var_d2[s,d,"○"] for d in period_d_indices2) +
+                              sum(var_d2[s,d,"△"] for d in period_d_indices2))
+                    p_公2 = sum(var_d2[s,d,"公"] for d in period_d_indices2)
+                    period_off2 = p_土2 + p_日2 + p_公2
+                    p_count = n_土 + n_日 + n_公
+                    # 合計の下限
+                    model2.Add(period_off2 >= p_count)
+                    if s not in shuunin_list:
+                        # 各種別ごとに下限 + 上限ペナルティ（model1が失敗した場合も種別を守る）
+                        if n_土 > 0:
+                            model2.Add(p_土2 >= n_土)
+                            diff_土 = model2.NewIntVar(0, N, f"diff_土_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_土 >= p_土2 - n_土)
+                            penalty2.append((diff_土, 500))
+                        else:
+                            # n_土=0のとき 土を使わせない（高ペナルティ）
+                            diff_土0 = model2.NewIntVar(0, N, f"diff_土0_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_土0 == p_土2)
+                            penalty2.append((diff_土0, 500))
+                        if n_日 > 0:
+                            model2.Add(p_日2 >= n_日)
+                            diff_日 = model2.NewIntVar(0, N, f"diff_日_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_日 >= p_日2 - n_日)
+                            penalty2.append((diff_日, 500))
+                        else:
+                            diff_日0 = model2.NewIntVar(0, N, f"diff_日0_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_日0 == p_日2)
+                            penalty2.append((diff_日0, 500))
+                        if n_公 > 0:
+                            model2.Add(p_公2 >= n_公)
+                            diff_公 = model2.NewIntVar(0, N, f"diff_公_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_公 >= p_公2 - n_公)
+                            penalty2.append((diff_公, 500))
+                        else:
+                            diff_公0 = model2.NewIntVar(0, N, f"diff_公0_{s}_{p_type}_{p_start.day}")
+                            model2.Add(diff_公0 == p_公2)
+                            penalty2.append((diff_公0, 500))
+                        # 合計超過ペナルティ
+                        diff_period = model2.NewIntVar(0, N, f"diff_period_{s}_{p_type}_{p_start.day}")
+                        model2.Add(diff_period >= period_off2 - p_count)
+                        penalty2.append((diff_period, 10))
 
             for s in all_staff_names:
                 var_d2 = xs2 if s in shuunin_list else x2
@@ -1185,6 +1339,16 @@ def generate_shift(file_path):
                     if req and req[0] == "有" and req[1] == "指定": pass
                     else: model2.Add(x2[s,d,"有"] == 0)
 
+            # 「公」は 32h スタッフのみ使用可能（model2）
+            for s in all_staff_names:
+                var_d2 = xs2 if s in shuunin_list else x2
+                if cont_map.get(s, "40h") != "32h":
+                    for d in range(N):
+                        req = requests.get(s, {}).get(days_norm[d])
+                        if req and req[1] == "指定" and req[0] == "公":
+                            continue
+                        model2.Add(var_d2[s, d, "公"] == 0)
+
             for s in all_staff_names:
                 if s in part_staff: continue
                 nen_limit = nenkyuu_limits.get(cont_map.get(s, "40h"), 2)
@@ -1210,7 +1374,7 @@ def generate_shift(file_path):
             for s in shuunin_list:
                 for d in range(N):
                     req = requests.get(s, {}).get(days_norm[d])
-                    for sh in ["遅","夜","日"]:
+                    for sh in ["遅","夜","日","△","公"]:
                         if sh in ["遅","夜"] and req and req[0] == sh and req[1] == "指定": continue
                         model2.Add(xs2[s,d,sh] == 0)
 
@@ -1365,8 +1529,8 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
     DATE_START_COL = 2
     SUMMARY_COL    = DATE_START_COL + N
 
-    SUMM_ABBR  = ["ハ", "ニ", "オ", "夜勤", "", "", "", "", "年", ""]
-    SUMM_FULL  = ["早出", "日勤", "遅出", "夜勤", "計", "○", "×", "計", "年休", "合計"]
+    SUMM_ABBR  = ["ハ", "ニ", "オ", "夜勤", "", "", "", "", "", "年", ""]
+    SUMM_FULL  = ["早出", "日勤", "遅出", "夜勤", "計", "日", "土", "公", "計", "年休", "合計"]
     NUM_SUMM   = len(SUMM_FULL)
 
     thin   = Side(style="thin")
@@ -1384,9 +1548,13 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
     DAILY_ROW_BASE = LAST_STAFF_ROW + 2
 
     SHIFT_ABBR = {"早": "ハ", "遅": "オ", "日": "ニ", "有": "年"}
+    # 内部記号 → 表示記号マッピング
+    DISPLAY_MAP = {"×": "土", "○": "日", "公": "公", "△": "日"}
 
     def display_val(s, d):
         sh = result_mod[s].get(d, "×")
+        if sh in DISPLAY_MAP:
+            return DISPLAY_MAP[sh]
         if sh == "日":
             return "ニ"
         if sh == "有":
@@ -1491,6 +1659,13 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
             f = cell_fill(s, d)
             if f:
                 cell.fill = f
+            # 土=青字、日=赤字、公=紫字
+            if val == "土":
+                cell.font = Font(color="0070C0", bold=False)
+            elif val == "日":
+                cell.font = Font(color="FF0000", bold=False)
+            elif val == "公":
+                cell.font = Font(color="7030A0", bold=False)
 
         ds  = get_column_letter(DATE_START_COL)
         de  = get_column_letter(DATE_START_COL + N - 1)
@@ -1505,16 +1680,18 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
                     f'+{get_column_letter(SUMMARY_COL+1)}{row}'
                     f'+{get_column_letter(SUMMARY_COL+2)}{row}'
                     f'+{get_column_letter(SUMMARY_COL+3)}{row}')
-        ws.cell(row, SUMMARY_COL + 5, f'=COUNTIF({rng},"○")')
-        ws.cell(row, SUMMARY_COL + 6, f'=COUNTIF({rng},"×")')
-        ws.cell(row, SUMMARY_COL + 7,
+        ws.cell(row, SUMMARY_COL + 5, f'=COUNTIF({rng},"日")')
+        ws.cell(row, SUMMARY_COL + 6, f'=COUNTIF({rng},"土")')
+        ws.cell(row, SUMMARY_COL + 7, f'=COUNTIF({rng},"公")')
+        ws.cell(row, SUMMARY_COL + 8,
                 f'={get_column_letter(SUMMARY_COL+5)}{row}'
-                f'+{get_column_letter(SUMMARY_COL+6)}{row}')
-        ws.cell(row, SUMMARY_COL + 8, f'=COUNTIF({rng},"年")')
-        ws.cell(row, SUMMARY_COL + 9,
+                f'+{get_column_letter(SUMMARY_COL+6)}{row}'
+                f'+{get_column_letter(SUMMARY_COL+7)}{row}')
+        ws.cell(row, SUMMARY_COL + 9, f'=COUNTIF({rng},"年")')
+        ws.cell(row, SUMMARY_COL + 10,
                 f'={get_column_letter(SUMMARY_COL+4)}{row}'
-                f'+{get_column_letter(SUMMARY_COL+7)}{row}'
-                f'+{get_column_letter(SUMMARY_COL+8)}{row}')
+                f'+{get_column_letter(SUMMARY_COL+8)}{row}'
+                f'+{get_column_letter(SUMMARY_COL+9)}{row}')
         for k2 in range(NUM_SUMM):
             c = ws.cell(row, SUMMARY_COL + k2)
             c.alignment = Alignment(horizontal="center")
@@ -1564,9 +1741,15 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
                     top   = old_b2.top    if old_b2.top    else thin,
                     bottom= old_b2.bottom if old_b2.bottom else thin)
 
+    # 日休み・土休み・公休 用フィル
+    NICHI_FILL = PatternFill("solid", fgColor="FFCCCC")  # 日=薄赤
+    DOYOU_FILL = PatternFill("solid", fgColor="CCE5FF")  # 土=薄青
+    KOU_FILL   = PatternFill("solid", fgColor="E8D5F5")  # 公=薄紫
+
     daily_labels = ["A早出", "B早出", "A遅出", "B遅出", "夜勤", "日勤"]
     daily_codes  = ["Aハ",   "Bハ",   "Aオ",  "Bオ",  "夜",  "ニ"]
     daily_fills  = [A_UNIT_FILL, B_UNIT_FILL, A_UNIT_FILL, B_UNIT_FILL, GRAY_FILL, GRAY_FILL]
+    daily_font_colors = [None, None, None, None, None, None]
 
     cnt_start_row = STAFF_START_ROW
     cnt_end_row   = LAST_STAFF_ROW
@@ -1643,446 +1826,9 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
 # ========================================================
 # Web UI HTML
 # ========================================================
-HTML_CONTENT = """
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1.0">
-    <title>Smart Shift by OR-Tools</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Noto+Sans+JP:wght@400;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <style>
-        :root {
-            --primary: #0066ff;
-            --accent: #00ff99;
-            --bg-deep: #0a0c10;
-            --bg-panel: #161b22;
-            --text-main: #e6edf3;
-            --text-dim: #8b949e;
-            --border: rgba(240, 246, 252, 0.1);
-        }
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html"), encoding="utf-8") as _f:
+    HTML_CONTENT = _f.read()
 
-        body { 
-            margin: 0; 
-            font-family: 'Inter', 'Noto Sans JP', sans-serif; 
-            background: var(--bg-deep); 
-            color: var(--text-main); 
-            display: flex; 
-            height: 100vh; 
-            overflow: hidden; 
-        }
-
-        /* --- サイドパネル --- */
-        .panel { 
-            width: 280px; 
-            background: var(--bg-panel); 
-            border-right: 1px solid var(--border); 
-            display: flex; 
-            flex-direction: column; 
-            padding: 20px; 
-            flex-shrink: 0; 
-            overflow-y: auto; 
-        }
-        .panel-right { border-right: none; border-left: 1px solid var(--border); width: 320px; }
-        
-        .header-logo { font-size: 1.1rem; font-weight: 800; color: #fff; margin-bottom: 4px; letter-spacing: 1px; }
-        .version-tag { font-size: 0.6rem; color: var(--text-dim); margin-bottom: 24px; }
-
-        .section-label { 
-            font-size: 0.75rem; 
-            color: var(--accent); 
-            font-weight: 700; 
-            margin: 20px 0 10px; 
-            display: flex; 
-            align-items: center; 
-            gap: 6px; 
-            border-left: 3px solid var(--accent);
-            padding-left: 8px;
-        }
-
-        /* --- カード表示 --- */
-        .info-card { 
-            background: rgba(255,255,255,0.03); 
-            border-radius: 6px; 
-            padding: 12px; 
-            margin-bottom: 10px; 
-            border: 1px solid var(--border); 
-        }
-        .info-label { font-size: 0.7rem; color: var(--text-dim); margin-bottom: 4px; display: block; }
-        .info-value { font-size: 1rem; font-weight: 600; font-family: 'JetBrains Mono'; }
-        
-        /* 負荷インジケーター */
-        .bar-container { height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; margin-top: 8px; overflow: hidden; }
-        .bar-fill { height: 100%; background: var(--primary); width: 0%; transition: width 0.4s, background 0.4s; }
-
-        /* --- 勤務割付状況（右パネル） --- */
-        .rule-grid { display: grid; grid-template-columns: 1fr; gap: 6px; }
-        .rule-item { 
-            font-size: 0.75rem; padding: 8px; 
-            background: rgba(255,255,255,0.02); border-radius: 4px; 
-            display: flex; align-items: center; justify-content: space-between;
-        }
-        .status-light { width: 8px; height: 8px; border-radius: 50%; background: #333; }
-        .light-active { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: blink 0.8s infinite; }
-
-        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-        /* --- 中央 メイン --- */
-        .main { flex-grow: 1; display: flex; flex-direction: column; background: radial-gradient(circle at center, #111827 0%, #0a0c10 100%); }
-        .top-bar { height: 50px; border-bottom: 1px solid var(--border); display: flex; align-items: center; padding: 0 24px; font-size: 0.8rem; color: var(--text-dim); }
-
-        .workspace { padding: 40px; display: flex; flex-direction: column; align-items: center; gap: 24px; flex-grow: 1; }
-
-        /* ドラッグドロップ */
-        .drop-area {
-            width: 100%; max-width: 640px; height: 180px; border: 2px dashed #30363d; border-radius: 12px;
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            background: rgba(22, 27, 34, 0.5); transition: 0.2s; cursor: pointer;
-        }
-        .drop-area:hover, .drop-area.drag-over { border-color: var(--primary); background: rgba(0, 102, 255, 0.05); }
-
-        .log-monitor {
-            width: 100%; max-width: 800px; height: 320px; background: #000; border-radius: 8px;
-            padding: 16px; font-family: 'JetBrains Mono'; font-size: 0.8rem;
-            overflow-y: auto; border: 1px solid #30363d; position: relative;
-        }
-        .log-row { color: #a3e635; margin-bottom: 3px; line-height: 1.4; }
-        .laser-scan { position: absolute; width: 100%; height: 2px; background: rgba(0, 255, 153, 0.3); box-shadow: 0 0 15px var(--accent); display: none; animation: scan 3s infinite linear; }
-        @keyframes scan { from { top: 0; } to { top: 100%; } }
-
-        .exec-button {
-            width: 100%; max-width: 400px; padding: 16px; border-radius: 8px; border: none;
-            background: var(--primary); color: white; font-weight: 700; font-size: 1rem;
-            cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 10px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-        }
-        .exec-button:hover:not(:disabled) { background: #1a75ff; transform: translateY(-1px); }
-        .exec-button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
-
-        .loader { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; display: none; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-
-        /* --- メインタイトルエリア --- */
-        .main-header {
-            padding: 30px 40px 10px;
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-        }
-
-        .logo-container {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 8px;
-            animation: fadeInSlide 1s ease-out;
-        }
-
-        .logo-symbol {
-            width: 40px;
-            height: 40px;
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 0 20px rgba(0, 102, 255, 0.4);
-        }
-
-        .brand-title {
-            font-size: 1.8rem;
-            font-weight: 800;
-            background: linear-gradient(to right, #fff, var(--text-dim));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.5px;
-        }
-
-        .brand-subtitle {
-            font-family: 'JetBrains Mono';
-            font-size: 0.75rem;
-            color: var(--accent);
-            text-transform: uppercase;
-            letter-spacing: 3px;
-            margin-left: 2px;
-            opacity: 0.8;
-        }
-
-        .header-line {
-            width: 100%;
-            max-width: 640px;
-            height: 1px;
-            background: linear-gradient(to right, var(--primary), transparent);
-            margin-top: 15px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .header-line::after {
-            content: '';
-            position: absolute;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(to right, transparent, var(--accent), transparent);
-            animation: lineScan 3s infinite linear;
-        }
-
-        @keyframes fadeInSlide {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-
-        @keyframes lineScan {
-            0% { left: -100%; }
-            100% { left: 100%; }
-        }
-    </style>
-</head>
-<body>
-
-<aside class="panel">
-    
-
-    <div class="section-label">システム正常性</div>
-    <div class="info-card">
-        <span class="info-label">計算負荷</span>
-        <div class="info-value" id="loadStatus">待機中</div>
-        <div class="bar-container"><div class="bar-fill" id="loadBar" style="width:2%"></div></div>
-    </div>
-
-    <div class="section-label">解析済みデータ</div>
-    <div id="fileInspector">
-        <div style="font-size:0.75rem; color:var(--text-dim);">ファイルが未投入です</div>
-    </div>
-
-    <div class="section-label">エンジン構成</div>
-    <div style="font-size:0.7rem; color:var(--text-dim); line-height:2;">
-        ・マルチスレッド： 有効<br>
-        ・制約モデル： CP-SAT<br>
-        ・タイムアウト： 300秒<br>
-        ・優先度： 最適解重視
-    </div>
-</aside>
-
-<main class="main">
-   <header class="main-header">
-        <div class="logo-container">
-            <div class="logo-symbol">
-                <i data-lucide="cpu" color="#fff" size="24"></i>
-            </div>
-            <div>
-                <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools</span></div>
-                <div class="brand-subtitle">The Intelligent Auto-Roster Engine</div>
-            </div>
-        </div>
-        <div class="header-line"></div>
-    </header>
-    
-    <div class="workspace">
-        <div id="dropZone" class="drop-area">
-            <i data-lucide="file-spreadsheet" size="36" style="margin-bottom:12px; color:var(--primary);"></i>
-            <span style="font-weight:700;">Excelファイルをドロップ</span>
-            <span id="filePrompt" style="font-size:0.75rem; color:var(--text-dim); margin-top:8px;">(ここにファイルをドラッグしてください)</span>
-            <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsm" style="display:none;">
-        </div>
-
-        <button id="runBtn" class="exec-button" disabled>
-            <div class="loader" id="loader"></div>
-            <span id="btnLabel">最適化計算を実行</span>
-        </button>
-
-        <div class="log-monitor" id="logMonitor">
-            <div class="laser-scan" id="laser"></div>
-            <div id="logBody"></div>
-        </div>
-    </div>
-</main>
-
-<aside class="panel panel-right">
-    <div class="section-label">最適化メトリクス</div>
-    <div class="info-card">
-        <span class="info-label">経過時間（ライブ）</span>
-        <div class="info-value" id="elapsedTime">0.00秒</div>
-    </div>
-    
-    <div class="info-card">
-        <span class="info-label">計算適合率（精度）</span>
-        <div class="info-value" id="scoreValue" style="color:var(--accent);">--</div>
-        <div class="bar-container"><div class="bar-fill" id="scoreBar"></div></div>
-    </div>
-    <div class="info-card">
-        <span class="info-label">処理時間</span>
-        <div class="info-value" id="timeValue">--</div>
-    </div>
-
-    <div class="section-label">ハード制約（絶対条件）</div>
-    <div class="rule-grid">
-        <div class="rule-item"><span>1. Shift_Requestsの希望・指定を厳守</span><div class="status-light" id="L1"></div></div>
-        <div class="rule-item"><span>2. 前月最終日が夜勤の場合、当月1日目は「○」</span><div class="status-light" id="L2"></div></div>
-        <div class="rule-item"><span>3. Staff_Masterの固定公休欄に従い指定曜日は「×」</span><div class="status-light" id="L3"></div></div>
-        <div class="rule-item"><span>4. ユニットA/B 各1名早出・1名遅出、夜勤全体1名</span><div class="status-light" id="L4"></div></div>
-        <div class="rule-item"><span>5. Staff_Masterの夜勤最少〜最高を厳守</span><div class="status-light" id="L5"></div></div>
-        <div class="rule-item"><span>6. 夜勤翌日は必ず「○」、通常公休「×」との区別</span><div class="status-light" id="L6"></div></div>
-        <div class="rule-item"><span>7. 連続夜勤（○可能職員）の翌2日は「○」</span><div class="status-light" id="L7"></div></div>
-        <div class="rule-item"><span>8. 遅→翌早は絶対禁止</span><div class="status-light" id="L8"></div></div>
-        <div class="rule-item"><span>9. 希望休・有給の前日に夜勤を入れない</span><div class="status-light" id="L9"></div></div>
-        <div class="rule-item"><span>10. 40h：最大5連勤、32h・パート：最大4連勤</span><div class="status-light" id="L10"></div></div>
-        <div class="rule-item"><span>11. 公休数下限 Settingsの設定値以上の「×」を確保</span><div class="status-light" id="L11"></div></div>
-        <div class="rule-item"><span>12. 備考による勤務制限</span><div class="status-light" id="L12"></div></div>
-        <div class="rule-item"><span>13. 週単位勤務日数 「週N日勤務」の備考に従いパートの勤務日数を管理</span><div class="status-light" id="L13"></div></div>        
-    </div>
-
-    <div class="section-label">ソフト制約（ペナルティ最小化）</div>
-    <div class="rule-grid">
-        <div class="rule-item"><span>1. 主任の補充は最小限に</span><div class="status-light" id="L14"></div></div>
-        <div class="rule-item"><span>2. 連続夜勤は避ける</span><div class="status-light" id="L15"></div></div>
-        <div class="rule-item"><span>3. 公休数の目標値近似</span><div class="status-light" id="L16"></div></div>
-        <div class="rule-item"><span>4. リーダー以外の早・遅勤務数を均等に</span><div class="status-light" id="L17"></div></div>
-        <div class="rule-item"><span>5. 遅出翌日に日勤を極力入れない</span><div class="status-light" id="L18"></div></div>
-        <div class="rule-item"><span>6. ×/有なし11日連続をペナルティ化</span><div class="status-light" id="L19"></div></div>
-        <div class="rule-item"><span>7. 4日連続勤務を避ける</span><div class="status-light" id="L20"></div></div>
-        <div class="rule-item"><span>8. 早/遅の3日連続を避ける</span><div class="status-light" id="L21"></div></div>    
-    </div>
-
-    
-</aside>
-
-<script>
-    lucide.createIcons();
-    let targetFile = null;
-    let timerInterval = null; // タイマーをグローバルで管理
-
-    const dropZone = document.getElementById('dropZone');
-    const fileInput = document.getElementById('fileInput');
-    const runBtn = document.getElementById('runBtn');
-    const logBody = document.getElementById('logBody');
-    const laser = document.getElementById('laser');
-
-    // ドラッグ＆ドロップイベント
-    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(n => {
-        dropZone.addEventListener(n, e => { e.preventDefault(); e.stopPropagation(); });
-    });
-    ['dragenter', 'dragover'].forEach(n => dropZone.addEventListener(n, () => dropZone.classList.add('drag-over')));
-    ['dragleave', 'drop'].forEach(n => dropZone.addEventListener(n, () => dropZone.classList.remove('drag-over')));
-
-    dropZone.addEventListener('drop', e => {
-        if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
-    });
-    dropZone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', () => {
-        if (fileInput.files.length) handleFile(fileInput.files[0]);
-    });
-
-    function handleFile(file) {
-        targetFile = file;
-        runBtn.disabled = false;
-        document.getElementById('filePrompt').textContent = `準備完了: ${file.name}`;
-        document.getElementById('filePrompt').style.color = 'var(--accent)';
-        
-        document.getElementById('fileInspector').innerHTML = `
-            <div class="info-card">
-                <span class="info-label">対象ファイル名</span>
-                <div style="font-size:0.75rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${file.name}</div>
-            </div>
-            <div class="info-card">
-                <span class="info-label">データ整合性</span>
-                <div style="font-size:0.75rem; color:var(--accent);">正常（Excel形式）</div>
-            </div>
-        `;
-        addLog(`ファイルを読み込みました: ${file.name}`);
-    }
-
-    function addLog(msg, color = 'inherit') {
-        const div = document.createElement('div');
-        div.className = 'log-row';
-        div.style.color = color;
-        div.textContent = `> [${new Date().toLocaleTimeString()}] ${msg}`;
-        logBody.appendChild(div);
-        const monitor = document.getElementById('logMonitor');
-        monitor.scrollTop = monitor.scrollHeight;
-    }
-
-    runBtn.addEventListener('click', async () => {
-        if (!targetFile) return;
-
-        // 初期化
-        runBtn.disabled = true;
-        document.getElementById('loader').style.display = 'block';
-        document.getElementById('btnLabel').textContent = '最適化実行中...';
-        laser.style.display = 'block';
-        
-        // --- 経過時間タイマー開始 ---
-        const startTime = performance.now();
-        const elapsedDisplay = document.getElementById('elapsedTime');
-        const timeValueDisplay = document.getElementById('timeValue');
-        
-        // 以前のタイマーがあればクリア
-        if(timerInterval) clearInterval(timerInterval);
-        
-        timerInterval = setInterval(() => {
-            const now = performance.now();
-            const diff = ((now - startTime) / 1000).toFixed(2);
-            elapsedDisplay.textContent = diff + '秒';
-        }, 50);
-
-        // システム負荷演出
-        document.getElementById('loadStatus').textContent = '高負荷';
-        document.getElementById('loadBar').style.width = '98%';
-        document.getElementById('loadBar').style.background = '#ff4d4d';
-
-        // ルール点灯演出
-        const lights = ['L1','L2','L3','L4','L5','L6','L7','L8','L9','L10','L11','L12','L13','L14','L15','L16','L17','L18','L19','L20','L21'].map(id => document.getElementById(id));
-        const lightTimer = setInterval(() => {
-            lights.forEach(l => l.className = Math.random() > 0.5 ? 'status-light light-active' : 'status-light');
-        }, 200);
-
-
-        addLog("最適化モデルを初期化中...");
-        addLog("制約条件のマッピングを開始...");
-        
-        const fd = new FormData();
-        fd.append("file", targetFile);
-
-        try {
-            const res = await fetch("/generate-shift", {method: "POST", body: fd});
-            if (res.ok) {
-                // 完了時の処理
-                const finalTime = ((performance.now() - startTime) / 1000).toFixed(2);
-                timeValueDisplay.textContent = `${finalTime}秒`;
-                document.getElementById('scoreValue').textContent = '100%';
-                document.getElementById('scoreBar').style.width = '100%';
-                
-                addLog("最適解の構築が成功しました。");
-                
-                const blob = await res.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url; a.download = "SS_Result.xlsx"; a.click();
-            } else { throw new Error(); }
-         } catch (e) {
-            addLog("通信エラーが発生しました。サーバーの状態を確認してください。", "#ff4d4d");
-        } finally {
-            // タイマー停止
-            clearInterval(timerInterval);
-            clearInterval(lightTimer);
-            
-            lights.forEach(l => l.className = 'status-light');
-            runBtn.disabled = false;
-            document.getElementById('loader').style.display = 'none';
-            document.getElementById('btnLabel').textContent = '再計算を実行';
-            laser.style.display = 'none';
-            document.getElementById('loadStatus').textContent = '待機中';
-            document.getElementById('loadBar').style.width = '5%';
-            document.getElementById('loadBar').style.background = 'var(--primary)';
-        }
-    });
-</script>
-</body>
-</html>
-"""
 
 
 # ========================================================
