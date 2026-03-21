@@ -97,10 +97,10 @@
         .log-monitor {
             width: 100%; max-width: 640px; height: 260px; background: #000; border-radius: 8px;
             padding: 16px; font-family: 'JetBrains Mono'; font-size: 0.8rem;
-            overflow-y: auto; border: 1px solid #30363d; position: relative;
+            overflow-y: auto; overflow-x: hidden; border: 1px solid #30363d; position: relative;
         }
-        .log-row { color: #a3e635; margin-bottom: 3px; line-height: 1.4; }
-        .log-err  { color: #ff5252; margin-bottom: 3px; line-height: 1.4; }
+        .log-row { color: #a3e635; margin-bottom: 3px; line-height: 1.4; word-break: break-all; }
+        .log-err  { color: #ff5252; margin-bottom: 3px; line-height: 1.4; word-break: break-all; }
         .laser-scan { position: absolute; width: 100%; height: 2px; background: rgba(0,255,153,0.3); box-shadow: 0 0 15px var(--accent); display: none; animation: scan 3s infinite linear; top: 0; }
         @keyframes scan { from { top: 0; } to { top: 100%; } }
 
