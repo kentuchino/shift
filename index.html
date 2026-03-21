@@ -107,13 +107,22 @@
         @keyframes scan { from { top: 0; } to { top: calc(100% - 2px); } }
 
         .exec-button {
-            width: 100%; max-width: 400px; padding: 16px; border-radius: 8px; border: none;
+            flex: 1; padding: 16px; border-radius: 8px; border: none;
             background: var(--primary); color: white; font-weight: 700; font-size: 1rem;
             cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 10px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.5);
         }
         .exec-button:hover:not(:disabled) { background: #1a75ff; transform: translateY(-1px); }
         .exec-button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+        .stop-button {
+            padding: 16px 20px; border-radius: 8px; border: none;
+            background: #7f1d1d; color: #fca5a5; font-weight: 700; font-size: 1rem;
+            cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5); transition: background 0.2s;
+        }
+        .stop-button:hover:not(:disabled) { background: #991b1b; }
+        .stop-button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+        .btn-row { display: flex; gap: 10px; width: 100%; max-width: 640px; }
         .loader { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; display: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -194,10 +203,16 @@
             <span id="filePrompt">（.xlsx / .xls / .xlsm）</span>
         </div>
 
-        <button id="runBtn" class="exec-button" disabled onclick="onRun()">
-            <div class="loader" id="loader"></div>
-            <span id="btnLabel">最適化計算を実行</span>
-        </button>
+        <div class="btn-row">
+            <button id="runBtn" class="exec-button" disabled onclick="onRun()">
+                <div class="loader" id="loader"></div>
+                <span id="btnLabel">最適化計算を実行</span>
+            </button>
+            <button id="stopBtn" class="stop-button" disabled onclick="onStop()" title="計算を中止">
+                <i data-lucide="square" size="18"></i>
+                <span>停止</span>
+            </button>
+        </div>
 
         <div class="log-monitor" id="logMonitor">
             <div class="laser-scan" id="laser"></div>
@@ -251,6 +266,15 @@
 <script>
 lucide.createIcons();
 var timerInterval = null;
+var currentController = null;
+
+function onStop() {
+    if (currentController) {
+        currentController.abort();
+        currentController = null;
+        addLog('計算を停止しました。', 'log-err');
+    }
+}
 
 function addLog(msg, cls) {
     var d = document.createElement('div');
@@ -288,6 +312,7 @@ function onRun() {
     var file = fi.files[0];
 
     document.getElementById('runBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
     document.getElementById('loader').style.display = 'block';
     document.getElementById('btnLabel').textContent = '最適化実行中...';
     document.getElementById('laser').style.display = 'block';
@@ -314,10 +339,11 @@ function onRun() {
     addLog('最適化モデルを初期化中...');
     addLog('制約条件のマッピングを開始...');
 
+    currentController = new AbortController();
     var fd = new FormData();
     fd.append('file', file, file.name);
 
-    fetch('/generate-shift', {method: 'POST', body: fd})
+    fetch('/generate-shift', {method: 'POST', body: fd, signal: currentController.signal})
         .then(function(res) {
             if (res.ok) {
                 var finalTime = ((performance.now() - startTime) / 1000).toFixed(2);
@@ -340,12 +366,17 @@ function onRun() {
                 });
             }
         })
-        .catch(function(e) { addLog('通信エラー: ' + e.message, 'log-err'); })
+        .catch(function(e) {
+            if (e.name === 'AbortError') return;
+            addLog('通信エラー: ' + e.message, 'log-err');
+        })
         .finally(function() {
+            currentController = null;
             clearInterval(timerInterval);
             clearInterval(lightTimer);
             lights.forEach(function(l) { l.className = 'status-light'; });
             document.getElementById('runBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
             document.getElementById('loader').style.display = 'none';
             document.getElementById('btnLabel').textContent = '再計算を実行';
             document.getElementById('laser').style.display = 'none';
