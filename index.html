@@ -126,6 +126,55 @@
         .loader { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; display: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
+        /* プレビューモーダル */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.85); z-index: 1000;
+            overflow: auto; padding: 20px;
+        }
+        .modal-overlay.open { display: flex; flex-direction: column; align-items: center; }
+        .modal-box {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 10px; width: 100%; max-width: 1400px;
+            padding: 20px; position: relative;
+        }
+        .modal-close {
+            position: absolute; top: 12px; right: 16px;
+            background: none; border: none; color: var(--text-dim);
+            font-size: 1.4rem; cursor: pointer; line-height: 1;
+        }
+        .modal-close:hover { color: #fff; }
+        .preview-score {
+            display: inline-block; font-size: 1.2rem; font-weight: 800;
+            padding: 6px 18px; border-radius: 6px; margin-bottom: 14px;
+        }
+        /* シフト表グリッド */
+        .shift-table { border-collapse: collapse; font-size: 0.72rem; white-space: nowrap; }
+        .shift-table th, .shift-table td {
+            border: 1px solid #333; padding: 3px 5px;
+            text-align: center; min-width: 28px;
+        }
+        .shift-table th { background: #1F4E79; color: #fff; font-weight: 700; }
+        .shift-table .staff-name { text-align: left; min-width: 72px; background: #21262d; font-weight: 600; }
+        .sh-ハ, .sh-Aハ, .sh-Bハ { color: #60a5fa; }
+        .sh-オ, .sh-Aオ, .sh-Bオ { color: #a78bfa; }
+        .sh-夜 { color: #f97316; font-weight: 700; }
+        .sh-ニ { color: #4ade80; }
+        .sh-土 { color: #60a5fa; }
+        .sh-日 { color: #f87171; }
+        .sh-公 { color: #c084fc; }
+        .sh-年 { color: #facc15; }
+        .sh-sat { background: rgba(96,165,250,0.08); }
+        .sh-sun { background: rgba(248,113,113,0.08); }
+        .req-hope { background: rgba(255,182,193,0.25); }
+        .req-shite { background: rgba(144,238,144,0.25); }
+        /* 減点サマリー */
+        .deduct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; margin-top: 14px; }
+        .deduct-item { background: rgba(255,255,255,0.03); border-radius: 4px; padding: 7px 10px; border-left: 3px solid; font-size: 0.75rem; }
+        .deduct-0 { border-color: #4ade80; color: #86efac; }
+        .deduct-warn { border-color: #facc15; color: #fde68a; }
+        .deduct-bad { border-color: #f87171; color: #fca5a5; }
+
         .main-header { padding: 24px 40px 10px; display: flex; flex-direction: column; align-items: flex-start; }
         .logo-container { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
         .logo-symbol {
@@ -188,7 +237,7 @@
             <div>
                 <div class="brand-title">Smart Shift <span style="font-weight:300;">by OR-Tools</span></div>
                 <div class="brand-subtitle">The Intelligent Auto-Roster Engine</div>
-                <div style="font-size:0.65rem; color:var(--text-dim); margin-top:4px; letter-spacing:1px; opacity:0.5;">Creator by Kento Uchino</div>
+                <div style="font-size:0.65rem; color:var(--text-dim); margin-top:4px; letter-spacing:1px; opacity:0.5;">by Kento Uchino</div>
             </div>
         </div>
         <div class="header-line"></div>
@@ -203,10 +252,35 @@
             <span id="filePrompt">（.xlsx / .xls / .xlsm）</span>
         </div>
 
+        <!-- パターン数選択 + 事前チェック -->
+        <div style="width:100%;max-width:640px;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:8px;padding:12px 16px;">
+            <div style="font-size:0.75rem;color:var(--accent);font-weight:700;margin-bottom:8px;border-left:3px solid var(--accent);padding-left:8px;">生成パターン数</div>
+            <div style="display:flex;align-items:center;gap:10px;">
+                <select id="patternCount" style="flex:1;background:#21262d;color:var(--text-main);border:1px solid #444;border-radius:6px;padding:8px 10px;font-size:0.82rem;cursor:pointer;min-width:0;" onchange="onPatternChange()">
+                    <option value="1">1パターン（300秒 / 8スレッド）</option>
+                    <option value="2">2パターン（並列 / 各4スレッド）</option>
+                    <option value="3">3パターン（並列 / 各3スレッド）</option>
+                    <option value="4">4パターン（並列 / 各2スレッド）</option>
+                    <option value="5">5パターン（並列 / 各1スレッド）</option>
+                </select>
+                <span id="patternNote" style="font-size:0.7rem;color:var(--text-dim);white-space:nowrap;">xlsx</span>
+                <button id="validateBtn" class="exec-button" disabled onclick="onValidate()" style="flex:none;padding:8px 14px;font-size:0.82rem;background:#0d4f2e;box-shadow:none;gap:5px;white-space:nowrap;">
+                    <div class="loader" id="validateLoader"></div>
+                    <i data-lucide="shield-check" size="15"></i>
+                    <span id="validateLabel">事前チェック</span>
+                </button>
+            </div>
+        </div>
+
         <div class="btn-row">
             <button id="runBtn" class="exec-button" disabled onclick="onRun()">
                 <div class="loader" id="loader"></div>
                 <span id="btnLabel">最適化計算を実行</span>
+            </button>
+            <button id="previewBtn" class="exec-button" disabled onclick="onPreview()" style="background:#0d4f2e;flex:none;padding:14px 18px;font-size:0.9rem;">
+                <div class="loader" id="previewLoader"></div>
+                <i data-lucide="eye" size="16"></i>
+                <span id="previewLabel">プレビュー</span>
             </button>
             <button id="stopBtn" class="stop-button" disabled onclick="onStop()" title="計算を中止">
                 <i data-lucide="square" size="18"></i>
@@ -249,24 +323,103 @@
         <div class="rule-item"><span>12. 「公」は32hスタッフのみ使用可</span><div class="status-light" id="L12"></div></div>
         <div class="rule-item"><span>13. 備考による勤務制限を厳守</span><div class="status-light" id="L13"></div></div>
         <div class="rule-item"><span>14. 「週N日勤務」でパート勤務日数を管理</span><div class="status-light" id="L14"></div></div>
+        <div class="rule-item"><span>15. 前半夜勤NGの人は15日以前に夜勤を入れない</span><div class="status-light" id="L15"></div></div>
     </div>
 
     <div class="section-label">ソフト制約（ペナルティ最小化）</div>
     <div class="rule-grid">
-        <div class="rule-item"><span>1. 主任の補充は最小限に</span><div class="status-light" id="L15"></div></div>
-        <div class="rule-item"><span>2. 夜勤回数を目標値に近づける</span><div class="status-light" id="L16"></div></div>
-        <div class="rule-item"><span>3. リーダー以外の早・遅勤務数を均等に</span><div class="status-light" id="L17"></div></div>
-        <div class="rule-item"><span>4. 遅出翌日に日勤を極力入れない</span><div class="status-light" id="L18"></div></div>
-        <div class="rule-item"><span>5. 11日連続勤務（休みなし）を避ける</span><div class="status-light" id="L19"></div></div>
-        <div class="rule-item"><span>6. 4日連続勤務を避ける</span><div class="status-light" id="L20"></div></div>
-        <div class="rule-item"><span>7. 早/遅の3日連続を避ける</span><div class="status-light" id="L21"></div></div>
+        <div class="rule-item"><span>1. 主任の補充は最小限に</span><div class="status-light" id="L16"></div></div>
+        <div class="rule-item"><span>2. 夜勤回数を目標値に近づける</span><div class="status-light" id="L17"></div></div>
+        <div class="rule-item"><span>3. リーダー以外の早・遅勤務数を均等に</span><div class="status-light" id="L18"></div></div>
+        <div class="rule-item"><span>4. 遅出翌日に日勤を極力入れない</span><div class="status-light" id="L19"></div></div>
+        <div class="rule-item"><span>5. 11日連続勤務（休みなし）を避ける</span><div class="status-light" id="L20"></div></div>
+        <div class="rule-item"><span>6. 4日連続勤務を避ける</span><div class="status-light" id="L21"></div></div>
+        <div class="rule-item"><span>7. 早/遅の3日連続を避ける</span><div class="status-light" id="L22"></div></div>
     </div>
 </aside>
+
+<!-- プレビューモーダル -->
+<div class="modal-overlay" id="previewModal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closePreview()">✕</button>
+    <h2 style="margin:0 0 10px;font-size:1.1rem;color:#fff;">シフト表プレビュー</h2>
+    <div id="previewScoreBar"></div>
+    <div style="overflow-x:auto;">
+      <table class="shift-table" id="previewTable"></table>
+    </div>
+    <div id="previewDeductions"></div>
+  </div>
+</div>
 
 <script>
 lucide.createIcons();
 var timerInterval = null;
 var currentController = null;
+var currentUid = null;
+var currentIsMulti = false;
+
+function onPreview() {
+    if (!currentUid) { addLog('先に生成を実行してください', 'log-err'); return; }
+    document.getElementById('previewBtn').disabled = true;
+    document.getElementById('previewLoader').style.display = 'block';
+    document.getElementById('previewLabel').textContent = '読込中…';
+
+    if (currentIsMulti) {
+        // 複数パターン: パターン数を取得してからタブ表示
+        fetch('/preview-result/' + currentUid + '_count')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var count = d.count;
+                _openMultiPreview(currentUid, count);
+            })
+            .catch(function(e) { addLog('プレビューエラー: ' + e.message, 'log-err'); })
+            .finally(function() {
+                document.getElementById('previewBtn').disabled = false;
+                document.getElementById('previewLoader').style.display = 'none';
+                document.getElementById('previewLabel').textContent = 'プレビュー';
+            });
+    } else {
+        fetch('/preview-result/' + currentUid)
+            .then(function(res) {
+                if (!res.ok) return res.json().then(function(j) { throw new Error(j.detail || 'エラー'); });
+                return res.json();
+            })
+            .then(function(data) { _renderPreview(data, null); })
+            .catch(function(e) { addLog('プレビューエラー: ' + e.message, 'log-err'); })
+            .finally(function() {
+                document.getElementById('previewBtn').disabled = false;
+                document.getElementById('previewLoader').style.display = 'none';
+                document.getElementById('previewLabel').textContent = 'プレビュー';
+            });
+    }
+}
+
+function _openMultiPreview(uid, count) {
+    // タブHTMLを生成してモーダル表示、最初のパターンを読み込む
+    var tabsHtml = '<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;">';
+    for (var i = 1; i <= count; i++) {
+        tabsHtml += '<button onclick="_switchPattern(\'' + uid + '\',' + i + ',' + count + ')" ' +
+            'id="tab_p' + i + '" style="padding:6px 14px;border-radius:6px;border:1px solid #444;' +
+            'background:' + (i===1?'var(--primary)':'#21262d') + ';color:#fff;cursor:pointer;font-size:0.8rem;">パターン ' + i + '</button>';
+    }
+    tabsHtml += '</div>';
+    document.getElementById('previewScoreBar').innerHTML = tabsHtml +
+        '<div id="patternScoreLabel"></div>';
+    document.getElementById('previewModal').classList.add('open');
+    _switchPattern(uid, 1, count);
+}
+
+function _switchPattern(uid, idx, count) {
+    // タブのアクティブ状態を更新
+    for (var i = 1; i <= count; i++) {
+        var tab = document.getElementById('tab_p' + i);
+        if (tab) tab.style.background = (i === idx) ? 'var(--primary)' : '#21262d';
+    }
+    fetch('/preview-result/' + uid + '_p' + idx)
+        .then(function(r) { return r.json(); })
+        .then(function(data) { _renderPreview(data, idx); })
+        .catch(function(e) { addLog('パターン' + idx + '読み込みエラー: ' + e.message, 'log-err'); });
+}
 
 function onStop() {
     if (currentController) {
@@ -300,7 +453,120 @@ function onFileChange() {
           '<div style="font-size:0.75rem;color:var(--accent);">' + (file.size / 1024).toFixed(1) + ' KB</div>' +
         '</div>';
     document.getElementById('runBtn').disabled = false;
+    document.getElementById('validateBtn').disabled = false;
     addLog('ファイルを読み込みました: ' + file.name);
+}
+
+function onPatternChange() {
+    var p = parseInt(document.getElementById('patternCount').value) || 1;
+    var note = document.getElementById('patternNote');
+    note.textContent = p === 1 ? 'xlsx' : 'zip';
+}
+
+function onValidate() {
+    var fi = document.getElementById('fileInput');
+    if (!fi.files || fi.files.length === 0) { addLog('ファイルを選択してください', 'log-err'); return; }
+    var file = fi.files[0];
+
+    document.getElementById('validateBtn').disabled = true;
+    document.getElementById('validateLoader').style.display = 'block';
+    document.getElementById('validateLabel').textContent = 'チェック中…';
+    addLog('▶ 事前チェックを開始します（最大15秒）...');
+
+    var fd = new FormData();
+    fd.append('file', file, file.name);
+
+    fetch('/validate', {method: 'POST', body: fd})
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+            if (data.feasible) {
+                addLog('━━ 事前チェック結果 ━━');
+                data.messages.forEach(function(m) { addLog(m); });
+                addLog('実行ボタンで計算を開始できます。');
+            } else {
+                addLog('━━ 事前チェック結果（問題あり） ━━', 'log-err');
+                data.messages.forEach(function(m) {
+                    m.split('\n').forEach(function(ln) {
+                        if (ln.trim()) addLog(ln, 'log-err');
+                    });
+                });
+            }
+        })
+        .catch(function(e) { addLog('チェックエラー: ' + e.message, 'log-err'); })
+        .finally(function() {
+            document.getElementById('validateBtn').disabled = false;
+            document.getElementById('validateLoader').style.display = 'none';
+            document.getElementById('validateLabel').textContent = '事前チェック';
+        });
+}
+
+function closePreview() {
+    document.getElementById('previewModal').classList.remove('open');
+}
+
+function _renderPreview(data, patternIdx) {
+    // スコアバー（複数パターンの場合はタブの下に表示）
+    var pct = Math.round(data.score / data.score_max * 100);
+    var col = pct >= 80 ? '#4ade80' : pct >= 60 ? '#facc15' : '#f87171';
+    var scoreHtml = '<span class="preview-score" style="background:' + col + '22;color:' + col +
+        ';border:1px solid ' + col + '44;">' +
+        (patternIdx ? 'パターン' + patternIdx + '　' : '') +
+        '採点 ' + data.score + ' / ' + data.score_max + ' 点　(' + pct + '%)' +
+        '</span>';
+
+    if (patternIdx) {
+        // 複数パターンモード: タブは保持してスコアラベルだけ更新
+        document.getElementById('patternScoreLabel').innerHTML = scoreHtml;
+    } else {
+        document.getElementById('previewScoreBar').innerHTML =
+            '<div style="margin-bottom:12px;">' + scoreHtml + '</div>';
+    }
+
+    // シフト表
+    var days = data.days;
+    var rows = data.rows;
+    var tbl = document.getElementById('previewTable');
+    var html = '<thead><tr><th class="staff-name">氏名</th>';
+    days.forEach(function(d) {
+        var cls = d.is_sat ? 'sh-sat' : d.is_sun ? 'sh-sun' : '';
+        html += '<th class="' + cls + '">' + d.day + '<br><small>' + d.wd + '</small></th>';
+    });
+    html += '</tr></thead><tbody>';
+
+    rows.forEach(function(row) {
+        html += '<tr><td class="staff-name">' + row.name + '</td>';
+        row.cells.forEach(function(cell, d) {
+            var day = days[d];
+            var bg = day.is_sat ? ' sh-sat' : day.is_sun ? ' sh-sun' : '';
+            var req = cell.r === '希望' ? ' req-hope' : cell.r === '指定' ? ' req-shite' : '';
+            var v = cell.v || '';
+            var shCls = ' sh-' + v.replace(/[AB]/, '');
+            html += '<td class="' + bg + req + shCls + '">' + v + '</td>';
+        });
+        html += '</tr>';
+    });
+    html += '</tbody>';
+    tbl.innerHTML = html;
+
+    // 減点サマリー
+    var deductHtml = '<div class="deduct-grid">';
+    if (data.deductions.length === 0) {
+        deductHtml += '<div class="deduct-item deduct-0">✓ 減点項目なし — 満点です！</div>';
+    } else {
+        data.deductions.forEach(function(d) {
+            var cls = d.total === 0 ? 'deduct-0' : d.total <= 30 ? 'deduct-warn' : 'deduct-bad';
+            deductHtml += '<div class="deduct-item ' + cls + '">' +
+                d.name + '<br>' +
+                '<strong>-' + d.total + '点</strong>（' + d.count + '件 × ' + d.per + '点）' +
+                '</div>';
+        });
+    }
+    deductHtml += '</div>';
+    document.getElementById('previewDeductions').innerHTML = deductHtml;
+
+    // モーダル表示
+    document.getElementById('previewModal').classList.add('open');
+    lucide.createIcons();
 }
 
 function onRun() {
@@ -328,7 +594,7 @@ function onRun() {
     }, 50);
 
     var lightIds = ['L1','L2','L3','L4','L5','L6','L7','L8','L9','L10',
-                    'L11','L12','L13','L14','L15','L16','L17','L18','L19','L20','L21'];
+                    'L11','L12','L13','L14','L15','L16','L17','L18','L19','L20','L21','L22'];
     var lights = lightIds.map(function(id) { return document.getElementById(id); });
     var lightTimer = setInterval(function() {
         lights.forEach(function(l) {
@@ -336,35 +602,57 @@ function onRun() {
         });
     }, 200);
 
-    addLog('最適化モデルを初期化中...');
-    addLog('制約条件のマッピングを開始...');
+    var patterns = parseInt(document.getElementById('patternCount').value) || 1;
+    if (patterns > 1) addLog(patterns + 'パターンを順番に生成します...');
+    addLog('制約モデルを構築中...');
 
-    currentController = new AbortController();
-    var fd = new FormData();
-    fd.append('file', file, file.name);
-
-    fetch('/generate-shift', {method: 'POST', body: fd, signal: currentController.signal})
-        .then(function(res) {
-            if (res.ok) {
-                var finalTime = ((performance.now() - startTime) / 1000).toFixed(2);
-                document.getElementById('timeValue').textContent = finalTime + '秒';
-                addLog('最適解の構築が成功しました。ダウンロードを開始します。');
-                return res.blob().then(function(blob) {
-                    var url = URL.createObjectURL(blob);
-                    var a = document.createElement('a');
-                    a.href = url; a.download = 'SS_Result.xlsx';
-                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                    setTimeout(function() { URL.revokeObjectURL(url); }, 3000);
+    // ① UID取得 → ② SSE購読 → ③ 計算送信
+    fetch('/start-session')
+        .then(function(r) { return r.json(); })
+        .then(function(session) {
+            var uid = session.uid;
+            var evtSrc = new EventSource('/progress/' + uid);
+            evtSrc.onmessage = function(e) {
+                if (e.data === '[完了]') { evtSrc.close(); return; }
+                if (e.data && e.data !== '(進捗なし)') addLog(e.data);
+            };
+            evtSrc.onerror = function() { evtSrc.close(); };
+            currentController = new AbortController();
+            var fd = new FormData();
+            fd.append('file', file, file.name);
+            return fetch('/generate-shift?patterns=' + patterns + '&uid=' + uid,
+                         {method: 'POST', body: fd, signal: currentController.signal})
+                .then(function(res) {
+                    evtSrc.close();
+                    if (res.ok) {
+                        document.getElementById('timeValue').textContent =
+                            ((performance.now() - startTime) / 1000).toFixed(2) + '秒';
+                        addLog('生成完了！ダウンロードを開始します。');
+                        var isZip = patterns > 1;
+                        // プレビュー対応
+                        currentUid = uid;
+                        currentIsMulti = isZip;
+                        document.getElementById('previewBtn').disabled = false;
+                        addLog('「プレビュー」ボタンでブラウザ確認できます。' + (isZip ? '（パターン切り替えタブあり）' : ''));
+                        return res.blob().then(function(blob) {
+                            var url = URL.createObjectURL(blob);
+                            var a = document.createElement('a');
+                            a.href = url;
+                            a.download = isZip ? 'SS_Result_複数パターン.zip' : 'SS_Result.xlsx';
+                            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                            setTimeout(function() { URL.revokeObjectURL(url); }, 3000);
+                            if (isZip) addLog('ZIPファイルに' + patterns + 'パターンが含まれています。');
+                        });
+                    } else {
+                        return res.text().then(function(t) {
+                            var msg = 'エラー (HTTP ' + res.status + ')';
+                            try { var j = JSON.parse(t); if (j && j.detail) msg = j.detail; } catch(ex) {}
+                            msg.split('\n').forEach(function(ln) {
+                                if (ln.trim()) addLog(ln, 'log-err');
+                            });
+                        });
+                    }
                 });
-            } else {
-                return res.text().then(function(t) {
-                    var msg = 'エラー (HTTP ' + res.status + ')';
-                    try { var j = JSON.parse(t); if (j && j.detail) msg = j.detail; } catch(ex) {}
-                    msg.split('\n').forEach(function(ln) {
-                        if (ln.trim()) addLog(ln, 'log-err');
-                    });
-                });
-            }
         })
         .catch(function(e) {
             if (e.name === 'AbortError') return;
@@ -374,7 +662,7 @@ function onRun() {
             currentController = null;
             clearInterval(timerInterval);
             clearInterval(lightTimer);
-            lights.forEach(function(l) { l.className = 'status-light'; });
+            lights.forEach(function(l) { if (l) l.className = 'status-light'; });
             document.getElementById('runBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
             document.getElementById('loader').style.display = 'none';
