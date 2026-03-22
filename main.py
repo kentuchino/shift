@@ -2759,23 +2759,32 @@ async def validate(file: UploadFile = File(...)):
 
 
 @app.post("/generate-shift")
-async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = ""):
+async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = "", timeout: int = 300):
     if not uid:
         uid = str(uuid.uuid4())
     if uid not in _progress_queues:
         _get_progress_queue(uid)
+    timeout = max(30, min(timeout, 3600))  # 30秒〜1時間に制限
     orig_name = file.filename or "upload.xlsx"
     ext  = os.path.splitext(orig_name)[1].lower()
     if ext not in [".xlsx", ".xls", ".xlsm"]:
         ext = ".xlsx"
     in_p = os.path.join(TEMP_DIR, f"in_{uid}{ext}")
-    patterns = max(1, min(patterns, 5))
+    patterns = max(1, min(patterns, 3))  # 最大3パターンに制限
 
     try:
         with open(in_p, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
         _push_progress(uid, f"ファイル読み込み完了: {orig_name}")
+
+        import time as _time
+        wall_start = _time.monotonic()  # 合計タイムアウト計測開始
+
+        def remaining():
+            """合計タイムアウトの残り秒数を返す（最低10秒保証）"""
+            elapsed = _time.monotonic() - wall_start
+            return max(10, timeout - int(elapsed))
 
         if patterns == 1:
             out_p = os.path.join(TEMP_DIR, f"out_{uid}.xlsx")
@@ -2785,7 +2794,7 @@ async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = "
              kanmu_map, prev_month, nmin_map, nmax_map,
              consec_night_map, holiday_periods,
              ojt_list, ojt_instructor) = generate_shift(
-                 in_p, random_seed=0, timeout=300, progress_uid=uid)
+                 in_p, random_seed=0, timeout=remaining(), progress_uid=uid)
             _push_progress(uid, "Excelファイルを生成中...")
             write_shift_result(
                 result, staff, shuunin_list, unit_map, cont_map, role_map,
@@ -2805,9 +2814,8 @@ async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = "
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 headers={"X-Progress-UID": uid})
         else:
-            # 複数パターン → 並列実行してZIPで返す
-            # 並列実行: 全パターンを同時に走らせ、合計時間を300秒に抑える
-            per_timeout = 300  # 並列なので全パターン同時実行 → 合計300秒
+            # 複数パターン → 並列実行
+            # 各パターンにその時点の残り時間を渡す（合計タイムアウト管理）
             import zipfile, io
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2817,22 +2825,22 @@ async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = "
             import os as _os
             total_cpu = _os.cpu_count() or 8
             per_workers = max(1, total_cpu // patterns)
-            per_timeout = 300
 
-            _push_progress(uid, f"{patterns}パターンを並列生成中（同時実行・各最大{per_timeout}秒・各{per_workers}スレッド）...")
+            _push_progress(uid, f"{patterns}パターンを並列生成中（合計タイムアウト: {timeout}秒 / 各{per_workers}スレッド）...")
 
             def run_one(i):
                 """1パターン生成して (i, out_path or None, error or None) を返す"""
                 seed = seeds[i] if i < len(seeds) else i * 137
                 out_p = os.path.join(TEMP_DIR, f"out_{uid}_p{i+1}.xlsx")
-                _push_progress(uid, f"パターン {i+1} 開始（seed={seed}）...")
+                solve_timeout = remaining()
+                _push_progress(uid, f"パターン {i+1} 開始（seed={seed} / 残り{solve_timeout}秒）...")
                 try:
                     (res, st, sh_l, u_map, c_map, r_map,
                      d_norm, reqs, ab_ur, sh_ur,
                      k_map, p_month, nm_min, nm_max,
                      cn_map, h_periods,
                      o_list, o_instr) = generate_shift(
-                         in_p, random_seed=seed, timeout=per_timeout,
+                         in_p, random_seed=seed, timeout=solve_timeout,
                          progress_uid=uid, num_workers=per_workers)
                     write_shift_result(
                         res, st, sh_l, u_map, c_map, r_map,
@@ -2879,8 +2887,6 @@ async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = "
 
             # 生成成功パターン数をキャッシュに記録（フロントがタブ数を知るため）
             _result_cache[f"{uid}_count"] = generated
-
-            _push_progress(uid, f"{patterns}パターンを並列生成中（同時実行・各最大{per_timeout}秒）...")
 
             zip_buf = io.BytesIO()
             generated = 0
