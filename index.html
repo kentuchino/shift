@@ -252,23 +252,27 @@
             <span id="filePrompt">（.xlsx / .xls / .xlsm）</span>
         </div>
 
-        <!-- パターン数選択 + 事前チェック -->
+        <!-- パターン数選択 + タイムアウト + 事前チェック -->
         <div style="width:100%;max-width:640px;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:8px;padding:12px 16px;">
-            <div style="font-size:0.75rem;color:var(--accent);font-weight:700;margin-bottom:8px;border-left:3px solid var(--accent);padding-left:8px;">生成パターン数</div>
-            <div style="display:flex;align-items:center;gap:10px;">
+            <div style="font-size:0.75rem;color:var(--accent);font-weight:700;margin-bottom:8px;border-left:3px solid var(--accent);padding-left:8px;">生成設定</div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:nowrap;">
                 <select id="patternCount" style="flex:1;background:#21262d;color:var(--text-main);border:1px solid #444;border-radius:6px;padding:8px 10px;font-size:0.82rem;cursor:pointer;min-width:0;" onchange="onPatternChange()">
-                    <option value="1">1パターン（300秒 / 8スレッド）</option>
+                    <option value="1">1パターン ✓ ネット推奨</option>
                     <option value="2">2パターン（並列 / 各4スレッド）</option>
                     <option value="3">3パターン（並列 / 各3スレッド）</option>
-                    <option value="4">4パターン（並列 / 各2スレッド）</option>
-                    <option value="5">5パターン（並列 / 各1スレッド）</option>
                 </select>
                 <span id="patternNote" style="font-size:0.7rem;color:var(--text-dim);white-space:nowrap;">xlsx</span>
+                <input id="timeoutInput" type="number" min="30" max="3600" placeholder="300秒（推奨）"
+                    style="width:130px;background:#21262d;color:var(--text-main);border:1px solid #444;border-radius:6px;padding:8px 10px;font-size:0.82rem;flex:none;"
+                    title="タイムアウト秒数（空欄で300秒）">
                 <button id="validateBtn" class="exec-button" disabled onclick="onValidate()" style="flex:none;padding:8px 14px;font-size:0.82rem;background:#0d4f2e;box-shadow:none;gap:5px;white-space:nowrap;">
                     <div class="loader" id="validateLoader"></div>
                     <i data-lucide="shield-check" size="15"></i>
                     <span id="validateLabel">事前チェック</span>
                 </button>
+            </div>
+            <div style="font-size:0.68rem;color:var(--text-dim);margin-top:6px;">
+                ⏱ タイムアウト: 空欄で300秒（推奨）　／　🌐 インターネット実行時は1パターンを推奨
             </div>
         </div>
 
@@ -603,8 +607,10 @@ function onRun() {
     }, 200);
 
     var patterns = parseInt(document.getElementById('patternCount').value) || 1;
-    if (patterns > 1) addLog(patterns + 'パターンを順番に生成します...');
-    addLog('制約モデルを構築中...');
+    var timeoutVal = parseInt(document.getElementById('timeoutInput').value);
+    if (!timeoutVal || timeoutVal < 30) timeoutVal = 300;
+    if (patterns > 1) addLog(patterns + 'パターンを並列生成します...');
+    addLog('制約モデルを構築中... （タイムアウト: ' + timeoutVal + '秒）');
 
     // ① UID取得 → ② SSE購読 → ③ 計算送信
     fetch('/start-session')
@@ -620,7 +626,7 @@ function onRun() {
             currentController = new AbortController();
             var fd = new FormData();
             fd.append('file', file, file.name);
-            return fetch('/generate-shift?patterns=' + patterns + '&uid=' + uid,
+            return fetch('/generate-shift?patterns=' + patterns + '&uid=' + uid + '&timeout=' + timeoutVal,
                          {method: 'POST', body: fd, signal: currentController.signal})
                 .then(function(res) {
                     evtSrc.close();
