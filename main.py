@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+import asyncio, threading, queue
 import pandas as pd
 import shutil, os, uuid, re, base64, pathlib
 from ortools.sat.python import cp_model
@@ -251,9 +252,12 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
                          allowed_shifts_map, fixed_holiday_map, holiday_limits,
                          cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
                          unit_map=None, ab_staff_set=None,
-                         weekday_allowed_map=None, nikkin_days_settings=None):
+                         weekday_allowed_map=None, nikkin_days_settings=None,
+                         ojt_list=None):
     msgs = []
     seen = set()
+    _ojt = set(ojt_list or [])
+    # OJTも診断対象に含める（staffはそのまま使用）
 
     def add_msg(m):
         if m not in seen:
@@ -446,20 +450,264 @@ def _diagnose_infeasible(staff, shuunin_list, requests, days_norm, N,
                 f"  → '指定'に変更するか、空白にしてください。"
             )
 
+    # ─── 日付単位の詳細衝突診断 ───────────────────────────────────────
+    if unit_map is not None and days_norm:
+        _ab_set = ab_staff_set or set()
+        OFF_SHIFTS = {"×", "有", "公", "△", "○"}
+        WD_JA = ["月","火","水","木","金","土","日"]
+
+        def is_off_on(s, dn):
+            req = requests.get(s, {}).get(dn)
+            if req and req[0] in OFF_SHIFTS:
+                return True
+            if dn.weekday() in (fixed_holiday_map.get(s) or set()):
+                return True
+            return False
+
+        def off_reason(s, dn):
+            req = requests.get(s, {}).get(dn)
+            if req and req[0] in OFF_SHIFTS:
+                return "希望休" if req[1] == "希望" else "指定休"
+            if dn.weekday() in (fixed_holiday_map.get(s) or set()):
+                return "固定休"
+            return "休み"
+
+        def can_work_shift(s, dn, sh):
+            if is_off_on(s, dn):
+                return False
+            req = requests.get(s, {}).get(dn)
+            if req and req[1] == "指定" and req[0] != sh:
+                return False
+            allowed = (allowed_shifts_map or {}).get(s)
+            if allowed is not None and sh not in allowed:
+                return False
+            wd = dn.weekday()
+            if s in (weekday_allowed_map or {}) and wd in weekday_allowed_map[s]:
+                if sh not in weekday_allowed_map[s][wd]:
+                    return False
+            return True
+
+        for d, dn in enumerate(days_norm):
+            date_label = f"{dn.month}月{dn.day}日({WD_JA[dn.weekday()]})"
+
+            # A早出
+            a_early = [s for s in staff if (unit_map.get(s) == "A" or s in _ab_set) and can_work_shift(s, dn, "早")]
+            shuunin_ok = [s for s in shuunin_list if not is_off_on(s, dn)]
+            if not a_early and not shuunin_ok:
+                off_list = [f"{s}（{off_reason(s,dn)}）" for s in staff if (unit_map.get(s) == "A" or s in _ab_set) and is_off_on(s, dn)]
+                detail = f"\n  休み中: {', '.join(off_list)}" if off_list else ""
+                add_msg(f"致命的エラー: {date_label} は Aユニット早出に配置できるスタッフがいません。{detail}\n  → 希望休・固定休を見直してください。")
+
+            # B早出
+            b_early = [s for s in staff if (unit_map.get(s) == "B" or s in _ab_set) and can_work_shift(s, dn, "早")]
+            if not b_early and not shuunin_ok:
+                off_list = [f"{s}（{off_reason(s,dn)}）" for s in staff if (unit_map.get(s) == "B" or s in _ab_set) and is_off_on(s, dn)]
+                detail = f"\n  休み中: {', '.join(off_list)}" if off_list else ""
+                add_msg(f"致命的エラー: {date_label} は Bユニット早出に配置できるスタッフがいません。{detail}\n  → 希望休・固定休を見直してください。")
+
+            # A遅出
+            a_late = [s for s in staff if (unit_map.get(s) == "A" or s in _ab_set) and can_work_shift(s, dn, "遅")]
+            if not a_late:
+                off_list = [f"{s}（{off_reason(s,dn)}）" for s in staff if (unit_map.get(s) == "A" or s in _ab_set) and is_off_on(s, dn)]
+                detail = f"\n  休み中: {', '.join(off_list)}" if off_list else ""
+                add_msg(f"致命的エラー: {date_label} は A遅出に配置できるスタッフがいません。{detail}\n  → 希望休・固定休を見直してください。")
+
+            # B遅出
+            b_late = [s for s in staff if (unit_map.get(s) == "B" or s in _ab_set) and can_work_shift(s, dn, "遅")]
+            if not b_late:
+                off_list = [f"{s}（{off_reason(s,dn)}）" for s in staff if (unit_map.get(s) == "B" or s in _ab_set) and is_off_on(s, dn)]
+                detail = f"\n  休み中: {', '.join(off_list)}" if off_list else ""
+                add_msg(f"致命的エラー: {date_label} は B遅出に配置できるスタッフがいません。{detail}\n  → 希望休・固定休を見直してください。")
+
+            # 夜勤
+            night_avail = [s for s in staff if nmax_map.get(s, 0) > 0 and can_work_shift(s, dn, "夜")]
+            if not night_avail:
+                off_list = [f"{s}（{off_reason(s,dn)}）" for s in staff if nmax_map.get(s, 0) > 0 and is_off_on(s, dn)]
+                detail = f"\n  夜勤可能スタッフの休み: {', '.join(off_list)}" if off_list else ""
+                add_msg(f"致命的エラー: {date_label} は夜勤に配置できるスタッフがいません。{detail}\n  → 希望休・固定休を見直してください。")
+
+    # ─── OJT固有の診断 ──────────────────────────────────────────────
+    if _ojt and unit_map is not None and days_norm:
+        WD_JA = ["月","火","水","木","金","土","日"]
+        OFF_SHIFTS_D = {"×", "有", "公", "△", "○"}
+
+        for s in _ojt:
+            instr = (ojt_list or []) and None  # dummy init
+        # ojt_instructorは渡されていないのでrequestsから類推するか、
+        # staffのholiday_limitsで判定する
+
+        # OJTの希望休チェック（通常スタッフと同様に）
+        for s in _ojt:
+            hol_limit = holiday_limits.get(cont_map.get(s, "40h"), 0)
+            if hol_limit == 0:
+                continue
+            hope_off = sum(1 for _, (sh, rt) in requests.get(s, {}).items()
+                           if sh in ["×","有","公","△"] and rt == "希望")
+            if hope_off > hol_limit:
+                add_msg(
+                    f"致命的エラー(OJT): {s}さん(OJT) の希望休({hope_off}日)が"
+                    f"公休数({hol_limit}日)を超えています。\n"
+                    f"  → Shift_Requestsで希望休を{hol_limit}日以内に絞ってください。"
+                )
+
+        # OJTに割り当てられた指導者が存在するか
+        # （ojt_instructorは診断関数に渡されていないため、
+        #   requests・note等から間接的に検出できる場合のみ警告）
+        for s in _ojt:
+            # 固定公休と希望の衝突チェック
+            for d, dn in enumerate(days_norm):
+                date_label = f"{dn.month}月{dn.day}日({WD_JA[dn.weekday()]})"
+                req = requests.get(s, {}).get(dn)
+                fixed_off = (dn.weekday() in (fixed_holiday_map.get(s) or set()))
+                if fixed_off and req and req[1] == "指定" and req[0] not in OFF_SHIFTS_D:
+                    add_msg(
+                        f"致命的エラー(OJT): {s}さん(OJT) の {date_label} は固定公休ですが、"
+                        f"指定勤務({req[0]})が入っています。\n"
+                        f"  → 固定公休か指定勤務のどちらかを取り消してください。"
+                    )
+
     return msgs
 
-def generate_shift(file_path):
+# ========================================================
+# 計算進捗管理
+# ========================================================
+_progress_queues: dict = {}  # uid -> queue.Queue
+_result_cache: dict   = {}  # uid -> preview JSON dict（生成結果キャッシュ）
+
+def _cache_preview(uid: str, result, staff, shuunin_list, unit_map, cont_map,
+                   role_map, days_norm, requests, ab_unit_result, shuunin_unit_result,
+                   kanmu_map, prev_month, nmin_map, nmax_map, consec_night_map, holiday_periods):
+    """生成結果からプレビューJSONを作ってキャッシュする"""
+    try:
+        DISPLAY_MAP = {"×": "土", "○": "日", "公": "公", "△": "日"}
+        SHIFT_ABBR  = {"早": "ハ", "遅": "オ", "日": "ニ", "有": "年"}
+
+        def disp(s, d):
+            sh = result.get(s, {}).get(d, "×")
+            if sh in DISPLAY_MAP: return DISPLAY_MAP[sh]
+            if sh == "日": return "ニ"
+            if sh == "有": return "年"
+            if sh not in ("早", "遅"): return sh
+            abbr = SHIFT_ABBR[sh]
+            if s in shuunin_list:
+                unit = shuunin_unit_result.get(s, {}).get(d)
+                return (unit + abbr) if unit else abbr
+            elif kanmu_map.get(s, "×") == "○":
+                unit = ab_unit_result.get(s, {}).get(d)
+                return (unit + abbr) if unit else abbr
+            else:
+                unit = unit_map.get(s, "")
+                return (unit + abbr) if unit in ("A", "B") else abbr
+
+        def req_type(s, d):
+            dn = days_norm[d]
+            req = requests.get(s, {}).get(dn)
+            return req[1] if req else ""
+
+        WD = ["月","火","水","木","金","土","日"]
+        days_info = [{"day": dn.day, "wd": WD[dn.weekday()],
+                      "is_sat": dn.weekday()==5, "is_sun": dn.weekday()==6}
+                     for dn in days_norm]
+
+        all_staff = shuunin_list + staff
+        rows = []
+        for s in all_staff:
+            cells = [{"v": disp(s, d), "r": req_type(s, d)} for d in range(len(days_norm))]
+            rows.append({"name": s, "unit": unit_map.get(s, "主任"), "cells": cells})
+
+        total_score, total_max, all_rows = score_shift(
+            result, staff, shuunin_list, days_norm, requests,
+            prev_month, cont_map, role_map, nmin_map, nmax_map,
+            consec_night_map, holiday_periods, unit_map,
+            ab_unit_result, shuunin_unit_result, kanmu_map)
+
+        deduct_items = [{"name": n, "count": c, "per": p, "total": t}
+                        for n, c, p, t in all_rows if t > 0]
+
+        _result_cache[uid] = {
+            "days": days_info, "rows": rows,
+            "score": total_score, "score_max": total_max,
+            "deductions": deduct_items
+        }
+    except Exception:
+        pass  # キャッシュ失敗はサイレントに無視
+
+
+def _get_progress_queue(uid: str) -> queue.Queue:
+    q = queue.Queue()
+    _progress_queues[uid] = q
+    return q
+
+def _push_progress(uid: str, msg: str):
+    if uid and uid in _progress_queues:
+        _progress_queues[uid].put(msg)
+
+def _close_progress(uid: str):
+    if uid and uid in _progress_queues:
+        _progress_queues[uid].put(None)  # sentinel
+        _progress_queues.pop(uid, None)
+
+
+class ProgressCallback(cp_model.CpSolverSolutionCallback):
+    """OR-Tools が解を見つけるたびに呼ばれるコールバック"""
+    def __init__(self, uid: str, N: int, phase: str = ""):
+        super().__init__()
+        self._uid = uid
+        self._N = N
+        self._phase = phase
+        self._count = 0
+        self._start = None
+
+    def on_solution_callback(self):
+        import time
+        if self._start is None:
+            self._start = time.time()
+        self._count += 1
+        elapsed = time.time() - self._start
+        obj = int(self.ObjectiveValue())
+        msg = (f"{self._phase}解 #{self._count} 発見 "
+               f"| スコア目標値: {obj} "
+               f"| 経過: {elapsed:.1f}秒")
+        _push_progress(self._uid, msg)
+
+
+def generate_shift(file_path, random_seed=0, validate_only=False, timeout=300, progress_uid=None, num_workers=8):
     xls = pd.ExcelFile(file_path)
     staff_df    = xls.parse("Staff_Master",   header=None)
     settings_df = xls.parse("Settings",       header=None)
     request_df  = xls.parse("Shift_Requests", header=None)
     prev_df     = xls.parse("Prev_Month",     header=None)
 
+    # ── 通常スタッフ（最初の「職員名」ヘッダーまで） ──────────────────
+    first_header_row = None
     for i in range(len(staff_df)):
         if str(staff_df.iloc[i, 0]).strip() == "職員名":
+            first_header_row = i
             staff_df.columns = staff_df.iloc[i]
             staff_df = staff_df.iloc[i+1:].reset_index(drop=True)
             break
+
+    # ── OJT スタッフ（2つ目の「職員名」ヘッダーを探す） ───────────────
+    # staff_df には既に1行目ヘッダーが除去されているので、残りから探す
+    ojt_df = None
+    ojt_header_idx = None
+    for i in range(len(staff_df)):
+        val = str(staff_df.iloc[i, 0]).strip()
+        if val == "職員名":
+            ojt_header_idx = i
+            break
+
+    if ojt_header_idx is not None:
+        # OJT セクションを切り出し
+        ojt_block = staff_df.iloc[ojt_header_idx:].copy()
+        ojt_block.columns = ojt_block.iloc[0]
+        ojt_block = ojt_block.iloc[1:].reset_index(drop=True)
+        ojt_block = ojt_block[ojt_block["職員名"].notna()].copy()
+        ojt_block = ojt_block[~ojt_block["職員名"].astype(str).isin(["nan","0",""])].copy()
+        ojt_block["職員名"] = ojt_block["職員名"].astype(str).str.strip()
+        # 通常スタッフ側からOJTセクションを除去
+        staff_df = staff_df.iloc[:ojt_header_idx].copy()
+        ojt_df = ojt_block
 
     staff_df = staff_df[staff_df["職員名"].notna()].copy()
     staff_df = staff_df[~staff_df["職員名"].astype(str).isin(["nan","0",""])].copy()
@@ -489,6 +737,12 @@ def generate_shift(file_path):
     nmin_map  = dict(zip(staff_df["職員名"], staff_df["夜勤最少数"]))
     nmax_map  = dict(zip(staff_df["職員名"], staff_df["夜勤最高数"]))
     note_map  = get_map("備考")
+
+    # 前半夜勤NG（K列）: ○ の人は月の前半（15日以前）に夜勤を入れない
+    zenhan_ng_map = get_map("前半夜勤NG", default="×")
+    for k in zenhan_ng_map:
+        if zenhan_ng_map[k] in ["", "nan", "None"]:
+            zenhan_ng_map[k] = "×"
 
     # 連続夜勤（J列追加対応）
     consec_night_map = get_map("連続夜勤希望", default="")
@@ -526,7 +780,75 @@ def generate_shift(file_path):
     shuunin_list = [s for s in all_staff_names
                     if str(unit_map.get(s, "")).lower() in ("nan", "", "none")]
     staff = [s for s in all_staff_names if s not in shuunin_list]
-    part_staff = [s for s in staff if cont_map[s] == "パート"]
+    part_staff = [s for s in staff if cont_map.get(s) == "パート"]
+
+    # ── OJT スタッフの処理 ─────────────────────────────────────────────
+    ojt_list = []       # OJT スタッフ名リスト
+    ojt_instructor = {} # ojt名 → 指導者名
+
+    # OJT の契約区分を holiday_limits の既知キーに正規化するマッピング
+    # 「特定技能」「研修生」等 → "32h" か "40h" に近い方へ正規化
+    VALID_CONT_KEYS = {"40h", "32h", "パート"}
+    def normalize_cont(ct):
+        if ct in VALID_CONT_KEYS:
+            return ct
+        # 週32h以下っぽいキーワードなら32h、それ以外は40h
+        if any(kw in ct for kw in ["32", "パート", "短", "特定", "研修", "OJT"]):
+            return "32h"
+        return "40h"
+
+    if ojt_df is not None and len(ojt_df) > 0:
+        def ojt_col_num(df, name, default=0):
+            if name in df.columns:
+                col_data = df[name]
+                if isinstance(col_data, pd.DataFrame):
+                    col_data = col_data.iloc[:, 0]
+                return pd.to_numeric(col_data, errors="coerce").fillna(default).astype(int)
+            return pd.Series([default]*len(df))
+
+        ojt_df["夜勤最少数"] = ojt_col_num(ojt_df, "夜勤最少数", 0)
+        ojt_df["夜勤最高数"] = ojt_col_num(ojt_df, "夜勤最高数", 0)
+
+        for _, row in ojt_df.iterrows():
+            s = str(row["職員名"]).strip()
+            if not s or s in ("nan", "None", "0"):
+                continue
+            ojt_list.append(s)
+            # 指導者列（E列: "指導者" または "ユニット兼務"）
+            instr_col = next((c for c in ojt_df.columns if "指導" in str(c)), None)
+            if instr_col is None:
+                instr_col = next((c for c in ojt_df.columns if "兼務" in str(c)), None)
+            instr = str(row[instr_col]).strip() if instr_col else ""
+            if instr not in ("nan", "None", ""):
+                ojt_instructor[s] = instr
+            # マップに追加（契約区分は正規化して登録）
+            unit_map[s]  = str(row.get("ユニット", "")).strip()
+            raw_cont     = str(row.get("契約区分", "40h")).strip()
+            cont_map[s]  = normalize_cont(raw_cont)
+            role_map[s]  = str(row.get("役職", "")).strip()
+            nmin_map[s]  = int(row["夜勤最少数"])
+            nmax_map[s]  = int(row["夜勤最高数"])
+            note_map[s]  = str(row.get("備考", "")).strip()
+            if note_map[s] in ("nan", "None"): note_map[s] = ""
+            kanmu_map[s] = "×"
+            zenhan_ng_map[s] = str(row.get("前半夜勤NG", "×")).strip()
+            if zenhan_ng_map[s] in ("nan", "None", ""): zenhan_ng_map[s] = "×"
+            cn_val = str(row.get("連続夜勤希望", "×")).strip()
+            if cn_val in ("nan", "None", ""): cn_val = "×"
+            consec_night_map[s] = cn_val
+            # 固定公休
+            fhcol2 = next((c for c in ojt_df.columns if "固定" in str(c) and "休" in str(c)), None)
+            if fhcol2:
+                fh_val = str(row.get(fhcol2, "")).strip()
+                if fh_val not in ("nan", "None", "", "-", "0"):
+                    wdays = [WEEKDAY_MAP[t.strip()] for t in re.split(r"[,、・\s]+", fh_val)
+                             if t.strip() in WEEKDAY_MAP]
+                    if wdays:
+                        fixed_holiday_map[s] = wdays
+            all_staff_names.append(s)
+
+        # OJT は staff リストに追加（ただし配置カウント対象外・part_staffには含めない）
+        staff.extend(ojt_list)
 
     days, holiday_limits, nenkyuu_limits, nikkin_days_settings, holiday_periods = load_settings(settings_df)
     N = len(days)
@@ -560,7 +882,7 @@ def generate_shift(file_path):
         if allowed is not None:
             allowed_shifts_map[s] = allowed
 
-        pattern = r"(月|火|水|木|金|土|日)曜?[は：:]+([^、。，．,.\s]+)"
+        pattern = r"(月|火|水|木|金|土|日)曜?[は：:]+([^。]+)"
         for m in re.finditer(pattern, note):
             wd_str = m.group(1)
             rule_str = m.group(2)
@@ -653,7 +975,7 @@ def generate_shift(file_path):
         for s in s_list:
             if s not in requests:
                 continue
-            for date_obj, (sh_type, _) in requests[s].items():
+            for date_obj, (sh_type, req_type) in requests[s].items():
                 for d, dn in enumerate(days_norm):
                     if dn == date_obj and sh_type in ALL_SHIFTS:
                         model.Add(var_dict[s,d,sh_type] == 1)
@@ -678,22 +1000,25 @@ def generate_shift(file_path):
                     continue
                 model.Add(var_dict[s,d_idx,"×"] == 1)
 
+    # OJT は配置カウントに含めない（非OJTのみで制約を構成）
+    non_ojt_staff = [s for s in staff if s not in ojt_list]
+
     for d in range(N):
-        a_e = ([x[s,d,"早"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+        a_e = ([x[s,d,"早"] for s in non_ojt_staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
                [uea[s,d] for s in ab_staff] +
                [shuunin_use_a[s,d] for s in shuunin_list])
         model.Add(sum(a_e) == 1)
 
-        a_l = ([x[s,d,"遅"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+        a_l = ([x[s,d,"遅"] for s in non_ojt_staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
                [ula[s,d] for s in ab_staff])
         model.Add(sum(a_l) == 1)
 
-        b_e = ([x[s,d,"早"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+        b_e = ([x[s,d,"早"] for s in non_ojt_staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
                [ueb[s,d] for s in ab_staff] +
                [shuunin_use_b[s,d] for s in shuunin_list])
         model.Add(sum(b_e) == 1)
 
-        b_l = ([x[s,d,"遅"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+        b_l = ([x[s,d,"遅"] for s in non_ojt_staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
                [ulb[s,d] for s in ab_staff])
         model.Add(sum(b_l) == 1)
 
@@ -701,12 +1026,22 @@ def generate_shift(file_path):
                                 if requests.get(s,{}).get(days_norm[d])
                                 and requests[s][days_norm[d]][0] == "夜"
                                 and requests[s][days_norm[d]][1] == "指定"]
-        model.Add(sum(x[s,d,"夜"] for s in staff) + sum(shuunin_night_vars_d) == 1)
+        model.Add(sum(x[s,d,"夜"] for s in non_ojt_staff) + sum(shuunin_night_vars_d) == 1)
 
     for s in staff:
         nt = sum(x[s,d,"夜"] for d in range(N))
         model.Add(nt >= nmin_map[s])
         model.Add(nt <= nmax_map[s])
+
+    # 前半夜勤NG: ○の人は15日以前に夜勤を入れない
+    for s in staff:
+        if zenhan_ng_map.get(s, "×") == "○":
+            for d, dn in enumerate(days_norm):
+                if dn.day <= 15:
+                    req = requests.get(s, {}).get(dn)
+                    if req and req[0] == "夜" and req[1] == "指定":
+                        continue
+                    model.Add(x[s, d, "夜"] == 0)
 
     for s in shuunin_list:
         for d in range(N):
@@ -913,6 +1248,28 @@ def generate_shift(file_path):
 
     penalty_terms = []
 
+    # ── OJT 制約 ─────────────────────────────────────────────────────
+    for s in ojt_list:
+        instr = ojt_instructor.get(s)
+        if not instr or instr not in all_staff_names:
+            continue
+        instr_vars = xs if instr in shuunin_list else x
+
+        for d in range(N):
+            # ハード制約: 指導者が夜勤の日はOJTを夜勤以外にする
+            if instr not in shuunin_list:
+                model.Add(x[s, d, "夜"] == 0).OnlyEnforceIf(x[instr, d, "夜"])
+            else:
+                # 主任が指導者の場合（稀）も同様
+                model.Add(x[s, d, "夜"] == 0).OnlyEnforceIf(xs[instr, d, "夜"])
+
+            # ソフト制約: 指導者と同じシフトを入れる（ペナルティ25）
+            for sh in ALL_SHIFTS:
+                diff = model.NewBoolVar(f"ojt_diff_{s}_{d}_{sh}")
+                model.Add(x[s, d, sh] != instr_vars[instr, d, sh]).OnlyEnforceIf(diff)
+                model.Add(x[s, d, sh] == instr_vars[instr, d, sh]).OnlyEnforceIf(diff.Not())
+                penalty_terms.append((diff, 25))
+
     # 期間別公休数制約（土/日/公 それぞれ個別に強制）
     # 土 = × のみ、日 = ○(夜勤明け) + △(standalone日)、公 = 公
     for s in all_staff_names:
@@ -1048,10 +1405,49 @@ def generate_shift(file_path):
     if obj_terms:
         model.Minimize(sum(obj_terms))
 
+    # validate_only モード: 短時間で実現可能性だけを確認
+    if validate_only:
+        solver_v = cp_model.CpSolver()
+        solver_v.parameters.max_time_in_seconds = 15
+        solver_v.parameters.num_search_workers  = num_workers
+        solver_v.parameters.random_seed         = 0
+        # 目的関数なし（実現可能解を探すだけ）
+        model_v = cp_model.CpModel()
+        # 同じ制約をそのまま使う（model は既に構築済み）
+        # → model をそのまま使ってソルブ（Minimize は無視されない問題があるので
+        #    タイムアウト内に FEASIBLE が出れば OK）
+        status_v = solver_v.Solve(model)
+        if status_v in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+            return {"feasible": True, "messages": ["✓ 制約チェック通過: 実現可能な解が存在します。計算を開始できます。"]}
+        else:
+            # INFEASIBLE or timeout → 詳細診断
+            diag_msgs = _diagnose_infeasible(
+                staff, shuunin_list, requests, days_norm, N,
+                allowed_shifts_map, fixed_holiday_map, holiday_limits,
+                cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
+                unit_map=unit_map, ab_staff_set=ab_staff_set,
+                weekday_allowed_map=weekday_allowed_map,
+                nikkin_days_settings=nikkin_days_settings,
+                ojt_list=ojt_list
+            )
+            if status_v == cp_model.INFEASIBLE:
+                prefix_msg = "制約が矛盾しているため解が存在しません。"
+            else:
+                prefix_msg = "15秒以内に実現可能解が見つかりませんでした（制約が厳しすぎる可能性があります）。"
+            all_msgs = [prefix_msg] + (diag_msgs or ["詳細な原因を特定できませんでした。"])
+            # 緩和提案を追加
+            suggestions = _suggest_relaxation("\n".join(all_msgs))
+            if suggestions:
+                all_msgs += ["", "【緩和提案】"] + suggestions
+            return {"feasible": False, "messages": all_msgs}
+
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300
-    solver.parameters.num_search_workers  = 8
-    status = solver.Solve(model)
+    solver.parameters.max_time_in_seconds = timeout
+    solver.parameters.num_search_workers  = num_workers
+    solver.parameters.random_seed         = random_seed
+    _push_progress(progress_uid, "モデル1: ソルバー開始...")
+    cb1 = ProgressCallback(progress_uid, N, "M1")
+    status = solver.Solve(model, cb1)
 
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
         model2 = cp_model.CpModel()
@@ -1097,14 +1493,14 @@ def generate_shift(file_path):
 
             for s in staff:
                 if s not in requests: continue
-                for date_obj, (sh_type, _) in requests[s].items():
+                for date_obj, (sh_type, req_type) in requests[s].items():
                     for d, dn in enumerate(days_norm):
                         if dn == date_obj and sh_type in ALL_SHIFTS:
                             model2.Add(x2[s,d,sh_type] == 1)
                             break
             for s in shuunin_list:
                 if s not in requests: continue
-                for date_obj, (sh_type, _) in requests[s].items():
+                for date_obj, (sh_type, req_type) in requests[s].items():
                     for d, dn in enumerate(days_norm):
                         if dn == date_obj and sh_type in ALL_SHIFTS:
                             model2.Add(xs2[s,d,sh_type] == 1)
@@ -1124,30 +1520,40 @@ def generate_shift(file_path):
                         model2.Add(var_dict[s,d_idx,"×"] == 1)
 
             for d in range(N):
-                a_e2 = ([x2[s,d,"早"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+                a_e2 = ([x2[s,d,"早"] for s in non_ojt_staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
                         [uea2[s,d] for s in ab_staff] +
                         [shuunin_use_a2[s,d] for s in shuunin_list])
                 model2.Add(sum(a_e2) == 1)
-                a_l2 = ([x2[s,d,"遅"] for s in staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
+                a_l2 = ([x2[s,d,"遅"] for s in non_ojt_staff if unit_map.get(s) == "A" and s not in ab_staff_set] +
                         [ula2[s,d] for s in ab_staff])
                 model2.Add(sum(a_l2) == 1)
-                b_e2 = ([x2[s,d,"早"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+                b_e2 = ([x2[s,d,"早"] for s in non_ojt_staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
                         [ueb2[s,d] for s in ab_staff] +
                         [shuunin_use_b2[s,d] for s in shuunin_list])
                 model2.Add(sum(b_e2) == 1)
-                b_l2 = ([x2[s,d,"遅"] for s in staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
+                b_l2 = ([x2[s,d,"遅"] for s in non_ojt_staff if unit_map.get(s) == "B" and s not in ab_staff_set] +
                         [ulb2[s,d] for s in ab_staff])
                 model2.Add(sum(b_l2) == 1)
                 shuunin_night_vars_d2 = [xs2[s,d,"夜"] for s in shuunin_list
                                          if requests.get(s,{}).get(days_norm[d])
                                          and requests[s][days_norm[d]][0] == "夜"
                                          and requests[s][days_norm[d]][1] == "指定"]
-                model2.Add(sum(x2[s,d,"夜"] for s in staff) + sum(shuunin_night_vars_d2) == 1)
+                model2.Add(sum(x2[s,d,"夜"] for s in non_ojt_staff) + sum(shuunin_night_vars_d2) == 1)
 
             for s in staff:
                 nt2 = sum(x2[s,d,"夜"] for d in range(N))
                 model2.Add(nt2 >= nmin_map[s])
                 model2.Add(nt2 <= nmax_map[s])
+
+            # 前半夜勤NG（model2）
+            for s in staff:
+                if zenhan_ng_map.get(s, "×") == "○":
+                    for d, dn in enumerate(days_norm):
+                        if dn.day <= 15:
+                            req = requests.get(s, {}).get(dn)
+                            if req and req[0] == "夜" and req[1] == "指定":
+                                continue
+                            model2.Add(x2[s, d, "夜"] == 0)
             for s in shuunin_list:
                 for d in range(N):
                     req = requests.get(s, {}).get(days_norm[d])
@@ -1389,6 +1795,20 @@ def generate_shift(file_path):
         for s in shuunin_list:
             for d in range(N):
                 penalty2.append((xs2[s,d,"早"], 100000))
+
+        # OJT 制約（model2）
+        for s in ojt_list:
+            instr = ojt_instructor.get(s)
+            if not instr or instr not in all_staff_names:
+                continue
+            instr_vars2 = xs2 if instr in shuunin_list else x2
+            for d in range(N):
+                model2.Add(x2[s, d, "夜"] == 0).OnlyEnforceIf(instr_vars2[instr, d, "夜"])
+                for sh in ALL_SHIFTS:
+                    diff2 = model2.NewBoolVar(f"ojt2_diff_{s}_{d}_{sh}")
+                    model2.Add(x2[s,d,sh] != instr_vars2[instr,d,sh]).OnlyEnforceIf(diff2)
+                    model2.Add(x2[s,d,sh] == instr_vars2[instr,d,sh]).OnlyEnforceIf(diff2.Not())
+                    penalty2.append((diff2, 25))
         
         non_leader2 = [s for s in staff if role_map.get(s) != "リーダー"]
         if len(non_leader2) >= 2:
@@ -1413,9 +1833,11 @@ def generate_shift(file_path):
             model2.Minimize(sum(obj2))
 
         solver2 = cp_model.CpSolver()
-        solver2.parameters.max_time_in_seconds = 300
-        solver2.parameters.num_search_workers  = 8
-        status2 = solver2.Solve(model2)
+        solver2.parameters.max_time_in_seconds = timeout
+        solver2.parameters.num_search_workers  = num_workers
+        _push_progress(progress_uid, "モデル1で解が見つからず → モデル2(緩和版)で再試行...")
+        cb2 = ProgressCallback(progress_uid, N, "M2")
+        status2 = solver2.Solve(model2, cb2)
 
         if status2 not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
             diag_msgs = _diagnose_infeasible(
@@ -1424,14 +1846,15 @@ def generate_shift(file_path):
                 cont_map, nmin_map, nmax_map, prev_month, weekly_work_days,
                 unit_map=unit_map, ab_staff_set=ab_staff_set,
                 weekday_allowed_map=weekday_allowed_map,
-                nikkin_days_settings=nikkin_days_settings
+                nikkin_days_settings=nikkin_days_settings,
+                ojt_list=ojt_list
             )
             if diag_msgs:
                 error_text = "【勤務表を生成できませんでした】\n以下の制約が矛盾している可能性があります：\n\n" + "\n".join(diag_msgs)
                 raise Exception(error_text)
             raise Exception(
-                "致命的エラー: 条件を満たすシフト表が見つかりませんでした。\n"
-                "希望シフト・夜勤回数・公休数の設定を見直してください。"
+                "致命的エラー: 主任を使った補充を含めても、条件を満たすシフト表が見つかりませんでした。\n"
+                "希望休・指定勤務・夜勤回数・公休数の設定を見直してください。"
             )
 
         solver = solver2
@@ -1483,12 +1906,251 @@ def generate_shift(file_path):
                 shuunin_unit_result[s][d] = None
 
     return (result, staff, shuunin_list, unit_map, cont_map, role_map,
-            days_norm, requests, ab_unit_result, shuunin_unit_result, kanmu_map, prev_month)
+            days_norm, requests, ab_unit_result, shuunin_unit_result, kanmu_map, prev_month,
+            nmin_map, nmax_map, consec_night_map, holiday_periods,
+            ojt_list, ojt_instructor)
+
+# ========================================================
+# 自己採点機能
+# ========================================================
+def score_shift(result, staff, shuunin_list, days_norm, requests,
+                prev_month, cont_map, role_map, nmin_map, nmax_map,
+                consec_night_map, holiday_periods, unit_map,
+                ab_unit_result, shuunin_unit_result, kanmu_map,
+                ojt_list=None):
+    """生成シフトを自己採点して (total_score, total_max, all_rows) を返す。
+    all_rows: [(項目名, 件数, 1件あたり減点, 合計減点, 減点あり?), ...]
+              減点がない項目も含む全採点基準を返す
+    OJTスタッフは採点対象外。
+    """
+    _ojt = set(ojt_list or [])
+    TOTAL = 1000
+    OFF_SHIFTS = {"×", "有", "公", "△", "○"}
+    results_dict = {}
+
+    def record(name, count, per):
+        pts = int(count * per) if isinstance(count, float) else count * per
+        results_dict[name] = (round(count, 1) if isinstance(count, float) else count, per, pts)
+
+    def get_sh(s, d):
+        return result.get(s, {}).get(d, "×")
+
+    def is_off(sh):
+        return sh in OFF_SHIFTS
+
+    N = len(days_norm)
+    # OJTを除いたスタッフリスト（採点対象外）
+    score_staff   = [s for s in staff      if s not in _ojt]
+    score_members = [s for s in (shuunin_list + staff) if s not in _ojt]
+
+    # ── 1. 夜勤回数が目標値からずれ ──────────────────────────────────
+    count = 0
+    for s in score_staff:
+        target = (nmin_map.get(s, 0) + nmax_map.get(s, 0)) / 2.0
+        actual = sum(1 for d in range(N) if get_sh(s, d) == "夜")
+        count += abs(actual - target)
+    record("①夜勤回数が目標値からずれ", count, 10)
+
+    # ── 2. 早出回数のばらつき（リーダー以外） ────────────────────────
+    non_leader = [s for s in score_staff if role_map.get(s) != "リーダー"]
+    if len(non_leader) >= 2:
+        counts_e = [sum(1 for d in range(N) if get_sh(s, d) == "早") for s in non_leader]
+        record("②早出回数のばらつき(max-min)", max(counts_e) - min(counts_e), 5)
+    else:
+        record("②早出回数のばらつき(max-min)", 0, 5)
+
+    # ── 3. 遅出回数のばらつき（リーダー以外） ────────────────────────
+    if len(non_leader) >= 2:
+        counts_l = [sum(1 for d in range(N) if get_sh(s, d) == "遅") for s in non_leader]
+        record("③遅出回数のばらつき(max-min)", max(counts_l) - min(counts_l), 5)
+    else:
+        record("③遅出回数のばらつき(max-min)", 0, 5)
+
+    # ── 4. 遅出→翌日早出 ─────────────────────────────────────────────
+    count = sum(1 for s in score_members for d in range(N-1)
+                if get_sh(s, d) == "遅" and get_sh(s, d+1) == "早")
+    record("④遅出→翌日早出", count, 20)
+
+    # ── 5. 11日連続で休みなし ────────────────────────────────────────
+    count = sum(1 for s in score_staff for start in range(N-10)
+                if all(not is_off(get_sh(s, d)) for d in range(start, start+11)))
+    record("⑤11日連続で休みなし", count, 50)
+
+    # ── 6. 4日連続勤務 ───────────────────────────────────────────────
+    count = sum(1 for s in score_staff for start in range(N-3)
+                if all(not is_off(get_sh(s, d)) for d in range(start, start+4)))
+    record("⑥4日連続勤務", count, 5)
+
+    # ── 7. 主任補充使用 ──────────────────────────────────────────────
+    count = sum(1 for s in shuunin_list for d in range(N) if get_sh(s, d) == "早")
+    record("⑦主任補充使用", count, 80)
+
+    # ── 8. 土/日/公の期間別超過 ──────────────────────────────────────
+    count = 0
+    for s in score_staff:
+        s_type = cont_map.get(s, "40h")
+        for (p_start, p_end, p_type, n_土, n_日, n_公) in holiday_periods:
+            if p_type != s_type: continue
+            didx = [d for d, dn in enumerate(days_norm) if p_start <= dn <= p_end]
+            if not didx: continue
+            act_土 = sum(1 for d in didx if get_sh(s, d) == "×")
+            act_日 = sum(1 for d in didx if get_sh(s, d) in ("○", "△"))
+            act_公 = sum(1 for d in didx if get_sh(s, d) == "公")
+            count += max(0, act_土 - n_土) + max(0, act_日 - n_日) + max(0, act_公 - n_公)
+    record("⑧土/日/公の期間別超過", count, 15)
+
+    # ── 9. 3連続早出 ─────────────────────────────────────────────────
+    count = sum(1 for s in score_members for d in range(N-2)
+                if get_sh(s, d) == "早" and get_sh(s, d+1) == "早" and get_sh(s, d+2) == "早")
+    record("⑨3連続早出", count, 10)
+
+    # ── 10. 3連続遅出 ────────────────────────────────────────────────
+    count = sum(1 for s in score_members for d in range(N-2)
+                if get_sh(s, d) == "遅" and get_sh(s, d+1) == "遅" and get_sh(s, d+2) == "遅")
+    record("⑩3連続遅出", count, 10)
+
+    # ── 12. 週に休みが1日以下 ────────────────────────────────────────
+    from collections import defaultdict as _dd
+    week_groups = _dd(list)
+    for d, dn in enumerate(days_norm):
+        sun_offset = (dn.weekday() + 1) % 7
+        week_sun = dn - timedelta(days=sun_offset)
+        week_groups[week_sun].append(d)
+    count = sum(1 for s in score_staff for wk, didx in week_groups.items()
+                if len(didx) == 7 and sum(1 for d in didx if is_off(get_sh(s, d))) <= 1)
+    record("⑫週の休みが1日以下", count, 20)
+
+    # ── 13. 月末月初で連続勤務 ───────────────────────────────────────
+    count = sum(1 for s in score_staff
+                if prev_month.get(s, []) and not is_off(prev_month[s][-1])
+                and prev_month[s][-1] != "夜" and N > 0 and not is_off(get_sh(s, 0)))
+    record("⑬前月末→当月1日が連続勤務", count, 10)
+
+    # ── 14. 夜勤間隔が7日以内（連続夜勤希望○は除く）────────────────
+    count = 0
+    for s in score_staff:
+        if consec_night_map.get(s, "×") == "○": continue
+        night_days = [d for d in range(N) if get_sh(s, d) == "夜"]
+        for i in range(len(night_days) - 1):
+            if night_days[i+1] - night_days[i] <= 7:
+                count += 1
+    record("⑭夜勤間隔7日以内（連続夜勤希望◯除く）", count, 15)
+
+    # ── 15. 夜勤が前半/後半に偏る（連続夜勤希望○は除く）────────────
+    mid = N // 2
+    count = 0
+    for s in score_staff:
+        if consec_night_map.get(s, "×") == "○": continue
+        n_first  = sum(1 for d in range(mid)    if get_sh(s, d) == "夜")
+        n_second = sum(1 for d in range(mid, N) if get_sh(s, d) == "夜")
+        if (n_first + n_second) >= 2 and abs(n_first - n_second) >= 3:
+            count += 1
+    record("⑮夜勤が前半/後半に偏る（連続夜勤希望◯除く）", count, 10)
+
+    # ── 19. 同契約区分内の総勤務日数ばらつき ─────────────────────────
+    for ct in ["40h", "32h"]:
+        grp = [s for s in score_staff if cont_map.get(s) == ct]
+        if len(grp) >= 2:
+            wc = [sum(1 for d in range(N) if not is_off(get_sh(s, d))) for s in grp]
+            record(f"⑲総勤務日数ばらつき({ct})", max(wc) - min(wc), 5)
+        else:
+            record(f"⑲総勤務日数ばらつき({ct})", 0, 5)
+
+    # ── 20. 夜勤回数のばらつき ────────────────────────────────────────
+    night_capable = [s for s in score_staff if nmax_map.get(s, 0) > 0]
+    if len(night_capable) >= 2:
+        nc = [sum(1 for d in range(N) if get_sh(s, d) == "夜") for s in night_capable]
+        record("⑳夜勤回数ばらつき", max(nc) - min(nc), 10)
+    else:
+        record("⑳夜勤回数ばらつき", 0, 10)
+
+    # ── 21. 特定スタッフへの早出集中 ─────────────────────────────────
+    if len(non_leader) >= 2:
+        counts_e2 = [sum(1 for d in range(N) if get_sh(s, d) == "早") for s in non_leader]
+        avg_e = sum(counts_e2) / len(counts_e2)
+        over = sum(max(0, c - (avg_e + 3)) for c in counts_e2)
+        record("㉑特定スタッフへの早出集中", over, 5)
+    else:
+        record("㉑特定スタッフへの早出集中", 0, 5)
+
+    # ── 23. 早出が月初/月末に集中 ──────────────────────────────────
+    early_days = set(range(3)) | set(range(N-3, N))
+    count = sum(1 for s in score_staff
+                if sum(1 for d in range(N) if get_sh(s, d) == "早") >= 4
+                and sum(1 for d in early_days if get_sh(s, d) == "早") >=
+                    sum(1 for d in range(N) if get_sh(s, d) == "早") * 0.5)
+    record("㉓早出が月初/月末に集中", count, 5)
+
+    # ── 24. 週4日以上遅出 ────────────────────────────────────────────
+    count = sum(1 for s in score_staff for wk, didx in week_groups.items()
+                if len(didx) >= 5 and sum(1 for d in didx if get_sh(s, d) == "遅") >= 4)
+    record("㉔週4日以上遅出", count, 15)
+
+    # ── 26. 希望勤務が叶わなかった ───────────────────────────────────
+    count = 0
+    for s in score_members:
+        var_d = result.get(s, {})
+        for date_obj, (sh_type, req_type) in requests.get(s, {}).items():
+            if req_type == "希望" and sh_type in {"早","遅","日","夜"}:
+                for d, dn in enumerate(days_norm):
+                    if dn == date_obj:
+                        if var_d.get(d) != sh_type:
+                            count += 1
+                        break
+    record("㉖希望勤務が叶わなかった", count, 10)
+
+    # ── 27. 前月末遅出→当月1日早出 ───────────────────────────────────
+    count = sum(1 for s in score_staff
+                if prev_month.get(s, []) and prev_month[s][-1] == "遅"
+                and N > 0 and get_sh(s, 0) == "早")
+    record("㉗前月末遅出→当月1日早出", count, 15)
+
+    # ── 全項目を順番通りに並べて返す ─────────────────────────────────
+    ALL_ITEMS = [
+        "①夜勤回数が目標値からずれ",
+        "②早出回数のばらつき(max-min)",
+        "③遅出回数のばらつき(max-min)",
+        "④遅出→翌日早出",
+        "⑤11日連続で休みなし",
+        "⑥4日連続勤務",
+        "⑦主任補充使用",
+        "⑧土/日/公の期間別超過",
+        "⑨3連続早出",
+        "⑩3連続遅出",
+        "⑫週の休みが1日以下",
+        "⑬前月末→当月1日が連続勤務",
+        "⑭夜勤間隔7日以内（連続夜勤希望◯除く）",
+        "⑮夜勤が前半/後半に偏る（連続夜勤希望◯除く）",
+        "⑲総勤務日数ばらつき(40h)",
+        "⑲総勤務日数ばらつき(32h)",
+        "⑳夜勤回数ばらつき",
+        "㉑特定スタッフへの早出集中",
+        "㉓早出が月初/月末に集中",
+        "㉔週4日以上遅出",
+        "㉖希望勤務が叶わなかった",
+        "㉗前月末遅出→当月1日早出",
+    ]
+
+    all_rows = []
+    for name in ALL_ITEMS:
+        if name in results_dict:
+            cnt, per, pts = results_dict[name]
+            all_rows.append((name, cnt, per, pts))
+        else:
+            all_rows.append((name, 0, 0, 0))
+
+    total_deduct = sum(r[3] for r in all_rows)
+    total_score = max(0, TOTAL - total_deduct)
+    return total_score, TOTAL, all_rows
+
 
 # (以下 `write_shift_result` からの処理は既存のままなので省略せず残しています)
 def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map,
                        days_norm, requests, ab_unit_result, shuunin_unit_result,
-                       kanmu_map, input_path, output_path, prev_month=None):
+                       kanmu_map, input_path, output_path, prev_month=None,
+                       nmin_map=None, nmax_map=None, consec_night_map=None,
+                       holiday_periods=None, role_map_extra=None,
+                       ojt_list=None, ojt_instructor=None):
     from openpyxl import Workbook
     from openpyxl.styles import Border, Side, PatternFill, Font, Alignment
     from openpyxl.utils import get_column_letter
@@ -1538,9 +2200,17 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
     thin_border   = Border(left=thin,   right=thin,   top=thin,   bottom=thin)
     header_border = Border(left=thin,   right=thin,   top=medium, bottom=medium)
 
+    _ojt = ojt_list or []
+    _ojt_instr = ojt_instructor or {}
+
+    # OJTをユニット最下行に配置：非OJTを先に、OJTを後に
     all_staff_ordered = shuunin_list + staff
-    group1 = [s for s in all_staff_ordered if unit_map.get(s, "") != "B"]
-    group2 = [s for s in all_staff_ordered if unit_map.get(s, "") == "B"]
+    group1_non_ojt = [s for s in all_staff_ordered if unit_map.get(s, "") != "B" and s not in _ojt]
+    group1_ojt     = [s for s in all_staff_ordered if unit_map.get(s, "") != "B" and s in _ojt]
+    group1 = group1_non_ojt + group1_ojt
+    group2_non_ojt = [s for s in all_staff_ordered if unit_map.get(s, "") == "B" and s not in _ojt]
+    group2_ojt     = [s for s in all_staff_ordered if unit_map.get(s, "") == "B" and s in _ojt]
+    group2 = group2_non_ojt + group2_ojt
 
     STAFF_START_ROW = 5
     first_group2_row = STAFF_START_ROW + len(group1)
@@ -1637,15 +2307,26 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
         c.fill = YELLOW_FILL
         c.border = header_border
 
+    OJT_FILL = PatternFill("solid", fgColor="FFF0E0")  # OJT薄オレンジ
+
     def write_staff_row(row, s, extra_top=False, extra_bottom=False):
         u = unit_map.get(s, "")
         is_shuunin = (s in shuunin_list)
+        is_ojt = (s in _ojt)
 
-        nc = ws.cell(row, 1, s)
+        # OJTは名前に指導者を併記
+        display_name = s
+        if is_ojt and s in _ojt_instr:
+            display_name = f"{s}(OJT/{_ojt_instr[s]})"
+
+        nc = ws.cell(row, 1, display_name)
         nc.alignment = Alignment(horizontal="center", vertical="center")
         if is_shuunin:
             nc.fill = BLUE_FILL
             nc.font = Font(bold=True)
+        elif is_ojt:
+            nc.fill = OJT_FILL
+            nc.font = Font(italic=True)
         elif u == "A":
             nc.fill = A_UNIT_FILL
         elif u == "B":
@@ -1820,6 +2501,126 @@ def write_shift_result(result, staff, shuunin_list, unit_map, cont_map, role_map
         left=0.4, right=0.4, top=0.7, bottom=0.7, header=0.3, footer=0.3)
     ws.print_title_rows = "1:4"
 
+    # ── スコアシート ────────────────────────────────────────────────
+    if nmin_map and nmax_map and consec_night_map is not None and holiday_periods is not None:
+        total_score, total_max, deductions = score_shift(
+            result, staff, shuunin_list, days_norm, requests,
+            prev_month, cont_map, role_map, nmin_map, nmax_map,
+            consec_night_map, holiday_periods, unit_map,
+            ab_unit_result, shuunin_unit_result, kanmu_map
+        )
+
+        ws_score = wb.create_sheet("スコアレポート")
+        SCORE_FILLS = {
+            "header": PatternFill("solid", fgColor="1F4E79"),
+            "ok":     PatternFill("solid", fgColor="E2EFDA"),
+            "warn":   PatternFill("solid", fgColor="FFF2CC"),
+            "bad":    PatternFill("solid", fgColor="FCE4D6"),
+            "total":  PatternFill("solid", fgColor="D6E4F0"),
+        }
+
+        # タイトル行
+        c = ws_score.cell(1, 1, "シフト表 自己採点レポート")
+        c.font = Font(bold=True, size=14, color="FFFFFF")
+        c.fill = SCORE_FILLS["header"]
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_score.merge_cells("A1:E1")
+        ws_score.row_dimensions[1].height = 28
+
+        # 総合スコア
+        score_pct = total_score / total_max * 100
+        score_color = "ok" if score_pct >= 80 else "warn" if score_pct >= 60 else "bad"
+        ws_score.cell(2, 1, "総合スコア").font = Font(bold=True)
+        ws_score.cell(2, 1).alignment = Alignment(horizontal="center")
+        ws_score.cell(2, 1).fill = SCORE_FILLS[score_color]
+        c_score = ws_score.cell(2, 2, f"{total_score} / {total_max} 点")
+        c_score.font = Font(bold=True, size=14,
+                            color="375623" if score_pct >= 80 else "7F4B00" if score_pct >= 60 else "7F1810")
+        c_score.alignment = Alignment(horizontal="left", vertical="center")
+        ws_score.row_dimensions[2].height = 24
+
+        # 減点なしの場合も全項目を出力
+        # ヘッダー行
+        headers = ["採点項目", "件数", "1件あたり減点", "合計減点", "評価"]
+        for col, h in enumerate(headers, 1):
+            c = ws_score.cell(3, col, h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = SCORE_FILLS["header"]
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border
+
+        # 全採点項目の明細（減点0も含む）
+        for row_i, (name, cnt, per, total_d) in enumerate(deductions, 4):
+            if total_d == 0:
+                fill_key = "ok"
+                font_color = "375623"
+            elif total_d <= 30:
+                fill_key = "warn"
+                font_color = "7F4B00"
+            else:
+                fill_key = "bad"
+                font_color = "C00000"
+
+            ws_score.cell(row_i, 1, name).alignment = Alignment(horizontal="left")
+            ws_score.cell(row_i, 1).fill = SCORE_FILLS[fill_key]
+            ws_score.cell(row_i, 1).border = thin_border
+
+            ws_score.cell(row_i, 2, cnt).alignment = Alignment(horizontal="center")
+            ws_score.cell(row_i, 2).border = thin_border
+
+            ws_score.cell(row_i, 3, f"-{per}点").alignment = Alignment(horizontal="center")
+            ws_score.cell(row_i, 3).border = thin_border
+
+            if total_d == 0:
+                ws_score.cell(row_i, 4, "±0").alignment = Alignment(horizontal="center")
+                ws_score.cell(row_i, 4).font = Font(color="375623")
+            else:
+                ws_score.cell(row_i, 4, f"-{total_d}点").alignment = Alignment(horizontal="center")
+                ws_score.cell(row_i, 4).font = Font(bold=True, color=font_color)
+            ws_score.cell(row_i, 4).border = thin_border
+
+            star = "★★★" if total_d >= 100 else "★★" if total_d >= 50 else "★" if total_d >= 20 else ("✓" if total_d == 0 else "")
+            ws_score.cell(row_i, 5, star).alignment = Alignment(horizontal="center")
+            ws_score.cell(row_i, 5).font = Font(color="375623" if total_d == 0 else "C00000")
+            ws_score.cell(row_i, 5).border = thin_border
+
+        # 合計行
+        last_row = 4 + len(deductions)
+        ws_score.cell(last_row, 1, "合計減点").font = Font(bold=True)
+        ws_score.cell(last_row, 1).fill = SCORE_FILLS["total"]
+        ws_score.cell(last_row, 4, f"-{total_max - total_score}点").font = Font(bold=True, color="C00000")
+        ws_score.cell(last_row, 4).fill = SCORE_FILLS["total"]
+        for col in range(1, 6):
+            ws_score.cell(last_row, col).border = thin_border
+
+        # 列幅
+        ws_score.column_dimensions["A"].width = 32
+        ws_score.column_dimensions["B"].width = 10
+        ws_score.column_dimensions["C"].width = 16
+        ws_score.column_dimensions["D"].width = 12
+        ws_score.column_dimensions["E"].width = 8
+
+        # スコアを右下の空欄エリア（日別集計行 × サマリー列）に表示
+        sc = SUMMARY_COL
+        sr = DAILY_ROW_BASE      # 開始行
+        er = DAILY_ROW_BASE + len(daily_labels) - 1  # 終了行
+
+        # 結合セル: 全サマリー列 × 全日別集計行
+        score_range = f"{get_column_letter(sc)}{sr}:{get_column_letter(sc + NUM_SUMM - 1)}{er}"
+        ws.merge_cells(score_range)
+        score_cell = ws.cell(sr, sc)
+        score_cell.value = f"採点\n{total_score} / {total_max} 点"
+        score_cell.font = Font(
+            bold=True, size=16,
+            color="375623" if score_pct >= 80 else "7F4B00" if score_pct >= 60 else "C00000")
+        score_cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+        score_cell.fill = PatternFill(
+            "solid",
+            fgColor="E2EFDA" if score_pct >= 80 else "FFF2CC" if score_pct >= 60 else "FCE4D6")
+        score_cell.border = Border(
+            left=thin, right=thin, top=thin, bottom=thin)
+
     wb.save(output_path)
 
 
@@ -1842,32 +2643,290 @@ async def index():
 async def health():
     return {"status": "ok", "version": "6.0"}
 
+@app.get("/start-session")
+async def start_session():
+    """計算開始前にUIDを発行してSSE購読の準備をする"""
+    uid = str(uuid.uuid4())
+    _get_progress_queue(uid)
+    return {"uid": uid}
+
+
+@app.get("/progress/{uid}")
+async def progress_stream(uid: str):
+    """SSE: 計算進捗をリアルタイムストリーミング"""
+    async def event_gen():
+        q = _progress_queues.get(uid)
+        if q is None:
+            yield "data: (進捗なし)\n\n"
+            return
+        while True:
+            try:
+                msg = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: q.get(timeout=120))
+                if msg is None:
+                    yield "data: [完了]\n\n"
+                    break
+                yield f"data: {msg}\n\n"
+            except Exception:
+                break
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/preview-result/{uid}")
+async def preview_result(uid: str):
+    """生成済みシフト結果のプレビューJSONを返す（再計算なし）
+    単一パターン: uid そのまま
+    複数パターン: uid_p1, uid_p2... のいずれか、または uid_count でパターン数を返す
+    """
+    # パターン数問い合わせ
+    if uid.endswith("_count"):
+        base = uid[:-6]
+        count = _result_cache.get(uid)
+        if count is None:
+            raise HTTPException(status_code=404, detail="データがありません")
+        return {"count": count}
+    data = _result_cache.get(uid)
+    if data is None:
+        raise HTTPException(status_code=404, detail="プレビューデータがありません。先に生成を実行してください。")
+    return data
+
+
+def _suggest_relaxation(error_msg: str) -> list:
+    """INFEASIBLE エラーから緩和できる制約を提案する"""
+    suggestions = []
+    e = error_msg
+
+    if "Aユニット早出" in e or "Bユニット早出" in e:
+        suggestions.append("→ 主任をAまたはBユニット兼務に設定すると早出補充に使えます（Staff_MasterのユニットをA・Bに変更）")
+    if "遅出" in e and "配置できるスタッフ" in e:
+        suggestions.append("→ 該当日の希望休を取り消すか、備考の勤務制限（遅出禁止等）を緩めてください")
+    if "夜勤に配置できる" in e:
+        suggestions.append("→ 夜勤可能スタッフの最高回数を1〜2回増やすか、夜勤不可スタッフの希望休を見直してください")
+    if "夜勤最少数合計" in e:
+        suggestions.append("→ 夜勤最少数の合計を対象日数以下に下げてください（例：各スタッフの最少数を1減らす）")
+    if "夜勤最高数合計" in e:
+        suggestions.append("→ 夜勤最高数の合計を対象日数以上に増やしてください（例：各スタッフの最高数を1増やす）")
+    if "公休数" in e or "希望休の数" in e:
+        suggestions.append("→ Shift_Requestsの希望休を減らすか、Settingsの公休日数設定を増やしてください")
+    if "夜勤上限" in e and "公休数" in e:
+        suggestions.append("→ 夜勤上限回数を公休数より少なくするか、公休数を夜勤上限以上に増やしてください")
+    if "連続夜勤" in e:
+        suggestions.append("→ 連続夜勤希望◯のスタッフを増やすか、夜勤最少数を下げてください")
+    if "前半夜勤NG" in e or "15日以前" in e:
+        suggestions.append("→ 前半夜勤NGのスタッフの夜勤最少数を下げるか、NGを外してください")
+    if "主任を使った補充を含めても" in e:
+        suggestions.append("→ 以下のいずれかを試してください：")
+        suggestions.append("   ① 最も制約の多い日の希望休・指定勤務を1つ取り消す")
+        suggestions.append("   ② 夜勤最少数を各スタッフ1回ずつ下げる")
+        suggestions.append("   ③ 備考の勤務制限（早出のみ・遅出のみ等）を一時的に外す")
+        suggestions.append("   ④ 公休日数の設定を1〜2日増やす（Settingsシート）")
+
+    if "OJT" in e or "(OJT)" in e:
+        suggestions.append("→ OJTスタッフの希望休・指定勤務が原因の可能性があります：")
+        suggestions.append("   ① OJTの希望休を減らすか、公休数設定を見直してください")
+        suggestions.append("   ② OJTと指導者が同じ日に休みを入れていないか確認してください")
+        suggestions.append("   ③ OJTの固定公休と指定勤務が衝突していないか確認してください")
+
+    if not suggestions:
+        suggestions.append("→ 希望シフト・夜勤回数・公休数の設定を見直してください")
+        suggestions.append("→ 事前チェックボタンで詳細な矛盾箇所を確認できます")
+
+    return suggestions
+
+
+@app.post("/validate")
+async def validate(file: UploadFile = File(...)):
+    """高速フィジビリティチェック: 15秒以内に実現可能解が存在するか確認する"""
+    uid = str(uuid.uuid4())
+    orig_name = file.filename or "upload.xlsx"
+    ext = os.path.splitext(orig_name)[1].lower()
+    if ext not in [".xlsx", ".xls", ".xlsm"]:
+        ext = ".xlsx"
+    in_p = os.path.join(TEMP_DIR, f"in_{uid}{ext}")
+    try:
+        with open(in_p, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        result = generate_shift(in_p, validate_only=True)
+        return result
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try: os.remove(in_p)
+        except: pass
+
+
 @app.post("/generate-shift")
-async def generate(file: UploadFile = File(...)):
-    uid  = str(uuid.uuid4())
-    # 入力ファイルの拡張子を保持（xlsm対応）
+async def generate(file: UploadFile = File(...), patterns: int = 1, uid: str = ""):
+    if not uid:
+        uid = str(uuid.uuid4())
+    if uid not in _progress_queues:
+        _get_progress_queue(uid)
     orig_name = file.filename or "upload.xlsx"
     ext  = os.path.splitext(orig_name)[1].lower()
     if ext not in [".xlsx", ".xls", ".xlsm"]:
         ext = ".xlsx"
-    in_p  = os.path.join(TEMP_DIR, f"in_{uid}{ext}")
-    out_p = os.path.join(TEMP_DIR, f"out_{uid}.xlsx")
+    in_p = os.path.join(TEMP_DIR, f"in_{uid}{ext}")
+    patterns = max(1, min(patterns, 5))
+
     try:
         with open(in_p, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        (result, staff, shuunin_list, unit_map, cont_map, role_map,
-         days_norm, requests, ab_unit_result, shuunin_unit_result,
-         kanmu_map, prev_month) = generate_shift(in_p)
-        write_shift_result(
-            result, staff, shuunin_list, unit_map, cont_map, role_map,
-            days_norm, requests, ab_unit_result, shuunin_unit_result,
-            kanmu_map, in_p, out_p, prev_month=prev_month)
-        return FileResponse(
-            out_p, filename="Shift_Result.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        _push_progress(uid, f"ファイル読み込み完了: {orig_name}")
+
+        if patterns == 1:
+            out_p = os.path.join(TEMP_DIR, f"out_{uid}.xlsx")
+            _push_progress(uid, "制約モデルを構築中...")
+            (result, staff, shuunin_list, unit_map, cont_map, role_map,
+             days_norm, requests, ab_unit_result, shuunin_unit_result,
+             kanmu_map, prev_month, nmin_map, nmax_map,
+             consec_night_map, holiday_periods,
+             ojt_list, ojt_instructor) = generate_shift(
+                 in_p, random_seed=0, timeout=300, progress_uid=uid)
+            _push_progress(uid, "Excelファイルを生成中...")
+            write_shift_result(
+                result, staff, shuunin_list, unit_map, cont_map, role_map,
+                days_norm, requests, ab_unit_result, shuunin_unit_result,
+                kanmu_map, in_p, out_p, prev_month=prev_month,
+                nmin_map=nmin_map, nmax_map=nmax_map,
+                consec_night_map=consec_night_map, holiday_periods=holiday_periods,
+                ojt_list=ojt_list, ojt_instructor=ojt_instructor)
+            # 生成結果をプレビュー用にキャッシュ
+            _cache_preview(uid, result, staff, shuunin_list, unit_map, cont_map,
+                           role_map, days_norm, requests, ab_unit_result, shuunin_unit_result,
+                           kanmu_map, prev_month, nmin_map, nmax_map,
+                           consec_night_map, holiday_periods)
+            _close_progress(uid)
+            return FileResponse(
+                out_p, filename="SS_Result.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"X-Progress-UID": uid})
+        else:
+            # 複数パターン → 並列実行してZIPで返す
+            # 並列実行: 全パターンを同時に走らせ、合計時間を300秒に抑える
+            per_timeout = 300  # 並列なので全パターン同時実行 → 合計300秒
+            import zipfile, io
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            seeds = [0, 42, 123, 777, 999]
+
+            # 並列実行: CPU競合を防ぐためワーカー数をパターン数で分割
+            import os as _os
+            total_cpu = _os.cpu_count() or 8
+            per_workers = max(1, total_cpu // patterns)
+            per_timeout = 300
+
+            _push_progress(uid, f"{patterns}パターンを並列生成中（同時実行・各最大{per_timeout}秒・各{per_workers}スレッド）...")
+
+            def run_one(i):
+                """1パターン生成して (i, out_path or None, error or None) を返す"""
+                seed = seeds[i] if i < len(seeds) else i * 137
+                out_p = os.path.join(TEMP_DIR, f"out_{uid}_p{i+1}.xlsx")
+                _push_progress(uid, f"パターン {i+1} 開始（seed={seed}）...")
+                try:
+                    (res, st, sh_l, u_map, c_map, r_map,
+                     d_norm, reqs, ab_ur, sh_ur,
+                     k_map, p_month, nm_min, nm_max,
+                     cn_map, h_periods,
+                     o_list, o_instr) = generate_shift(
+                         in_p, random_seed=seed, timeout=per_timeout,
+                         progress_uid=uid, num_workers=per_workers)
+                    write_shift_result(
+                        res, st, sh_l, u_map, c_map, r_map,
+                        d_norm, reqs, ab_ur, sh_ur,
+                        k_map, in_p, out_p, prev_month=p_month,
+                        nmin_map=nm_min, nmax_map=nm_max,
+                        consec_night_map=cn_map, holiday_periods=h_periods,
+                        ojt_list=o_list, ojt_instructor=o_instr)
+                    # 各パターンをプレビューキャッシュに保存
+                    _cache_preview(f"{uid}_p{i+1}", res, st, sh_l, u_map, c_map,
+                                   r_map, d_norm, reqs, ab_ur, sh_ur,
+                                   k_map, p_month, nm_min, nm_max, cn_map, h_periods)
+                    _push_progress(uid, f"✓ パターン {i+1} 完了")
+                    return (i, out_p, None)
+                except Exception as e:
+                    _push_progress(uid, f"✗ パターン {i+1} 失敗: {e}")
+                    return (i, None, str(e))
+
+            zip_buf = io.BytesIO()
+            generated = 0
+            errors = []
+            out_paths = {}
+
+            with ThreadPoolExecutor(max_workers=patterns) as executor:
+                futures = {executor.submit(run_one, i): i for i in range(patterns)}
+                for future in as_completed(futures):
+                    i, out_p, err = future.result()
+                    if err:
+                        errors.append(f"パターン{i+1}: {err}")
+                    else:
+                        out_paths[i] = out_p
+
+            # 番号順にZIPへ追加
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i in sorted(out_paths.keys()):
+                    out_p = out_paths[i]
+                    zf.write(out_p, f"SS_Result_パターン{i+1}.xlsx")
+                    generated += 1
+                    try: os.remove(out_p)
+                    except: pass
+
+            if generated == 0:
+                raise Exception("\n".join(errors))
+
+            # 生成成功パターン数をキャッシュに記録（フロントがタブ数を知るため）
+            _result_cache[f"{uid}_count"] = generated
+
+            _push_progress(uid, f"{patterns}パターンを並列生成中（同時実行・各最大{per_timeout}秒）...")
+
+            zip_buf = io.BytesIO()
+            generated = 0
+            errors = []
+            out_paths = {}
+
+            with ThreadPoolExecutor(max_workers=patterns) as executor:
+                futures = {executor.submit(run_one, i): i for i in range(patterns)}
+                for future in as_completed(futures):
+                    i, out_p, err = future.result()
+                    if err:
+                        errors.append(f"パターン{i+1}: {err}")
+                    else:
+                        out_paths[i] = out_p
+
+            # 番号順にZIPへ追加
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i in sorted(out_paths.keys()):
+                    out_p = out_paths[i]
+                    zf.write(out_p, f"SS_Result_パターン{i+1}.xlsx")
+                    generated += 1
+                    try: os.remove(out_p)
+                    except: pass
+
+            if generated == 0:
+                raise Exception("\n".join(errors))
+
+            zip_buf.seek(0)
+            zip_path = os.path.join(TEMP_DIR, f"out_{uid}.zip")
+            with open(zip_path, "wb") as f:
+                f.write(zip_buf.getvalue())
+            _push_progress(uid, f"全{generated}パターン完了！ZIPをダウンロードします。")
+            _close_progress(uid)
+            return FileResponse(
+                zip_path, filename="SS_Result_複数パターン.zip",
+                media_type="application/zip",
+                headers={"X-Progress-UID": uid})
+
     except Exception as e:
         import traceback; traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        _close_progress(uid)
+        suggestions = _suggest_relaxation(str(e))
+        detail = str(e)
+        if suggestions:
+            detail += "\n\n【緩和提案】\n" + "\n".join(suggestions)
+        raise HTTPException(status_code=500, detail=detail)
     finally:
         try: os.remove(in_p)
         except: pass
